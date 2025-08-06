@@ -347,7 +347,6 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
     )
     df = df[~summary_mask].copy()
 
-    # ---------- ④ 构造模板 ----------
     def col(c, default=""):
         return df[c] if c in df else pd.Series(default, index=df.index)
 
@@ -436,13 +435,15 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     new_rc = [p for p in rc_candidates if p not in old_rc]
 
     tl_files = [p for p in all_excel if "泰隆" in p.as_posix()]
-    mt_files = [p for p in all_excel if "民泰" in p.parent.as_posix()] 
+    mt_files = [p for p in all_excel if "民泰" in p.as_posix()] 
+    # tz_files = [p for p in all_excel if "台州银行" in p.as_posix()]
 
     print(
         f"✅ 网上银行 {len(china_files)} 份，"
         f"老农商 {len(old_rc)} 份，新农商 {len(new_rc)} 份，"
         f"泰隆银行 {len(tl_files)} 份，"
-        f"民泰银行 {len(mt_files)} 份 "
+        f"民泰银行 {len(mt_files)} 份"
+        # f"台州银行 {len(tz_files)} 份 "
     )
 
     dfs = []
@@ -525,6 +526,15 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         if not df.empty:
             df["来源文件"] = p.name
             dfs.append(df)
+
+    # # ----------- 台州银行 -----------
+    # for p in tz_files:
+    #     print(f"正在处理 {p.name} ...")
+    #     raw = _read_raw(p)
+    #     df  = tz_to_template(raw)
+    #     if not df.empty:
+    #         df["来源文件"] = p.name
+    #         dfs.append(df)
     
     print(f"文件读取已完成，正在整合分析！ ...")
 
