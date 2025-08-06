@@ -181,13 +181,222 @@ def _parse_dt(d, t, is_old):
     except Exception:
         return "wrong"
 
+# ===============================
+# ⑤   泰隆银行 → 模板
+# ===============================
+def tl_to_template(raw) -> pd.DataFrame:
+    """
+    泰隆银行流水 → 统一模板字段 TEMPLATE_COLS
+    2025-08-06  增强版：
+    • 传入  DataFrame  —— 原逻辑不变；返回单 sheet 的模板表
+    • 传入 dict[str, DataFrame] —— 自动遍历所有 sheet，
+      把各 sheet 解析后纵向合并；并在最前插入 "__sheet__" 列标明来源 sheet
+    """
+
+    # ---------- A. 若传入的是 {sheet: DataFrame} ----------
+    if isinstance(raw, dict):
+        frames = []
+        for sheet_name, df_sheet in raw.items():
+            one = tl_to_template(df_sheet)          # 递归走单-sheet 逻辑
+            if not one.empty:
+                one.insert(0, "__sheet__", sheet_name)
+                frames.append(one)
+        return (
+            pd.concat(frames, ignore_index=True)
+            if frames
+            else pd.DataFrame(columns=TEMPLATE_COLS)
+        )
+
+    # ---------- B. 单个 DataFrame：旧逻辑（提炼成内部函数） ----------
+    def _one_sheet(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=TEMPLATE_COLS)
+
+        # ====== 小工具 ======
+        def col(c, default=""):
+            return df[c] if c in df else pd.Series([default] * len(df), index=df.index)
+
+        def col_multi(keys, default=""):
+            for k in keys:
+                if k in df:
+                    return df[k]
+            return pd.Series([default] * len(df), index=df.index)
+
+        out = pd.DataFrame(columns=TEMPLATE_COLS)
+
+        # ====== 基本信息 ======
+        out["本方账号"] = out["查询账户"] = col_multi(["客户账号", "账号", "本方账号"], "wrong")
+        out["反馈单位"] = "泰隆银行"
+        out["查询对象"] = col_multi(["账户名称", "户名", "客户名称"], "wrong")
+        out["币种"] = col_multi(["币种", "货币", "币别"]).replace("156", "CNY").fillna("CNY")
+        out["借贷标志"] = col_multi(["借贷标志", "借贷方向", "借贷"], "")
+
+        # ====== 金额 / 余额 ======
+        debit = pd.to_numeric(col_multi(["借方发生额", "借方发生金额"], 0), errors="coerce")
+        credit = pd.to_numeric(col_multi(["贷方发生额", "贷方发生金额"], 0), errors="coerce")
+        out["交易金额"] = debit.fillna(0).where(debit.ne(0), credit)
+        out["账户余额"] = pd.to_numeric(col_multi(["账户余额", "余额"], 0), errors="coerce")
+
+        # ====== 时间字段 ======
+        dates = col_multi(["交易日期", "原交易日期", "会计日期"]).astype(str)
+        raw_times = col_multi(["交易时间", "原交易时间", "时间"]).astype(str).str.strip()
+
+        def _tidy_time(s: str) -> str:
+            if re.fullmatch(r"0+(\.0+)?", s):
+                return ""
+            if s.count(".") >= 2:
+                p = s.split(".")
+                if len(p[0]) == 2 and len(p[1]) == 2 and len(p[2]) == 2:
+                    return ".".join(p[:3])
+            return s
+
+        def _clean_time(s: str) -> str:
+            s = s.strip()
+            if re.fullmatch(r"0+(\.0+)?", s):
+                return ""
+            if re.fullmatch(r"\d{1,9}", s):
+                return s.zfill(9)[:6]        # HHMMSS
+            return s
+
+        times = raw_times.apply(lambda x: _clean_time(_tidy_time(x)))
+        out["交易时间"] = [
+            _parse_dt(d, t, is_old=False) for d, t in zip(dates, times)
+        ]
+
+        # ====== 其它字段 ======
+        out["交易流水号"]        = col_multi(["原柜员流水号", "流水号"])
+        out["交易类型"]          = col_multi(["交易码", "交易类型", "业务种类"])
+        out["交易对方姓名"]       = col_multi(["对方户名", "交易对手名称"], " ")
+        out["交易对方账户"]       = col_multi(["对方客户账号", "对方账号"], " ")
+        out["交易对方账号开户行"]   = col_multi(["对方金融机构名称", "对方开户行"], " ")
+        out["交易摘要"]          = col_multi(["摘要描述", "摘要"], " ")
+        out["交易网点代码"]        = col_multi(["机构号", "网点代码"], " ")
+        out["终端号"]           = col_multi(["渠道号", "终端号"], " ")
+        out["交易柜员号"]         = col_multi(["柜员号"], " ")
+        out["备注"]            = col_multi(["备注", "附言"], " ")
+
+        out["凭证种类"] = col_multi(["凭证类型"], "")
+        out["凭证号"]   = col_multi(["凭证序号"], "")
+
+        return out
+
+    # ---------- C. 传入的是 DataFrame ----------
+    return _one_sheet(raw)
+
+# ------------------------------------------------------------------
+# ⑤   民泰 → 模板
+# ------------------------------------------------------------------
+def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    民泰银行流水 → 统一模板字段 TEMPLATE_COLS
+    2025-08-06 修订：
+    1. 自动识别表头行（同时含“时间”“账号卡号”）并去掉前导说明行
+    2. 兼容“客户姓名/名称”在说明区的多种写法
+    3. 新增：过滤包含 “支出笔数 / 收入笔数” 等文字的汇总行
+    """
+    if raw.empty:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    # ---------- ① 识别表头行 ----------
+    header_idx = None
+    for i, row in raw.iterrows():
+        cells = row.astype(str).str.strip().tolist()
+        if "时间" in cells and "账号卡号" in cells:
+            header_idx = i
+            break
+    if header_idx is None:
+        for i, row in raw.iterrows():
+            if row.astype(str).str.contains("序号").any():
+                header_idx = i
+                break
+    if header_idx is None:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    # ---------- ② 提取客户姓名 ----------
+    holder = ""
+    name_inline = re.compile(r"客户(?:姓名|名称)\s*[:：]?\s*([^\s:：]{2,10})")
+    for i in range(header_idx):
+        vals = raw.iloc[i].astype(str).tolist()
+        for j, cell in enumerate(vals):
+            cs = cell.strip()
+            m = name_inline.match(cs)
+            if m:                                    # 同格：A1 = “客户名称:张三”
+                holder = m.group(1)
+                break
+            if re.fullmatch(r"客户(?:姓名|名称)\s*[:：]?", cs):  # 分列：A1 = “客户名称:”
+                nxt = str(vals[j + 1]).strip() if j + 1 < len(vals) else ""
+                if nxt and nxt.lower() != "nan":
+                    holder = nxt
+                    break
+        if holder:
+            break
+    holder = holder or "未知"
+
+    # ---------- ③ 数据区 ----------
+    df = raw.iloc[header_idx + 1:].copy()
+    df.columns = raw.iloc[header_idx].astype(str).str.strip()
+    df.dropna(how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # ★ 过滤“支出笔数 / 收入笔数 …”汇总行
+    summary_mask = df.apply(
+        lambda row: row.astype(str)
+        .str.contains(r"支出笔数|收入笔数|支出累计金额|收入累计金额")
+        .any(),
+        axis=1,
+    )
+    df = df[~summary_mask].copy()
+
+    # ---------- ④ 构造模板 ----------
+    def col(c, default=""):
+        return df[c] if c in df else pd.Series(default, index=df.index)
+
+    out = pd.DataFrame(columns=TEMPLATE_COLS)
+
+    # ===== 基本信息 =====
+    acct = col("账号卡号").astype(str).str.replace(r"\.0$", "", regex=True)
+    out["本方账号"] = out["查询账户"] = acct
+    out["查询对象"] = holder
+    out["反馈单位"] = "民泰银行"
+    out["币种"] = col("币种").astype(str).replace("人民币", "CNY").fillna("CNY")
+
+    # ===== 金额 / 借贷标志 =====
+    debit  = pd.to_numeric(col("支出"), errors="coerce").fillna(0)
+    credit = pd.to_numeric(col("收入"), errors="coerce").fillna(0)
+    out["交易金额"] = credit.where(credit.gt(0), -debit)
+    out["账户余额"] = pd.to_numeric(col("余额"), errors="coerce")
+    out["借贷标志"] = np.where(credit.gt(0), "进", "出")
+
+    # ===== 交易时间 =====
+    def _fmt_time(v: str) -> str:
+        v = str(v).strip()
+        try:
+            return datetime.datetime.strptime(v, "%Y%m%d %H:%M:%S").strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            return v or "wrong"
+
+    out["交易时间"] = col("时间").astype(str).apply(_fmt_time)
+
+    # ===== 其它字段 =====
+    out["交易摘要"]        = col("摘要", " ")
+    out["交易流水号"]      = col("柜员流水号").astype(str).str.strip()
+    out["交易柜员号"]       = col("记账柜员 ").astype(str).str.strip()
+    out["交易网点代码"]      = col("记账机构").astype(str).str.strip()
+    out["交易对方姓名"]     = col("交易对手名称", " ").astype(str).str.strip()
+    out["交易对方账户"]     = col("交易对手账号", " ").astype(str).str.strip()
+    out["交易对方账号开户行"] = col("交易对手行名", " ").astype(str).str.strip()
+    out["终端号"]         = col("交易渠道")
+    out["备注"]          = col("附言", " ")
+
+    return out
 # ------------------------------------------------------------------
 # ⑤   农商行 → 模板
 # ------------------------------------------------------------------
 def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame(columns=TEMPLATE_COLS)
-
     def col(c, default=""):
         return raw[c] if c in raw else pd.Series([default] * len(raw), index=raw.index)
 
@@ -202,10 +411,11 @@ def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame
     out["交易时间"] = [_parse_dt(d, t, is_old) for d, t in zip(dates, times)]
 
     out["借贷标志"] = col("借贷标志")          # 保留原值
-    out["币种"] = "CNY"
+    out["币种"] = "CNY" if is_old else col("币种").replace("人民币", "CNY")
     out["查询对象"] = holder
     out["交易对方姓名"] = col("对方姓名", " ")
     out["交易对方账户"] = col("对方账号", " ")
+    out["交易网点名称"] = col("代理行机构号") if is_old else col("交易机构")
     out["交易摘要"] = col("备注") if is_old else col("摘要", "wrong")
     return out
 
@@ -220,17 +430,26 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
 
     # 农商行文件
     all_excel = list(root.rglob("*.xls*"))
-    rc_candidates = [p for p in all_excel if "农商行" in p.as_posix()]   # ← 只看上级目录
+    rc_candidates = [p for p in all_excel if "农商行" in p.as_posix()]
     pattern_old = re.compile(r"老\s*[账帐]\s*(?:号|户)")
     old_rc = [p for p in rc_candidates if pattern_old.search(p.stem)]
     new_rc = [p for p in rc_candidates if p not in old_rc]
 
-    print(f"✅ 网上银行 {len(china_files)} 份，老农商 {len(old_rc)} 份，新农商 {len(new_rc)} 份")
+    tl_files = [p for p in all_excel if "泰隆" in p.as_posix()]
+    mt_files = [p for p in all_excel if "民泰" in p.parent.as_posix()] 
+
+    print(
+        f"✅ 网上银行 {len(china_files)} 份，"
+        f"老农商 {len(old_rc)} 份，新农商 {len(new_rc)} 份，"
+        f"泰隆银行 {len(tl_files)} 份，"
+        f"民泰银行 {len(mt_files)} 份 "
+    )
 
     dfs = []
 
     # -------------------- 网上银行 --------------------
     for p in china_files:
+        print(f"正在处理 {p.name} ...")
         try:
             df = pd.read_excel(
                 p,
@@ -249,6 +468,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
 
     # -------------------- 农商行 --------------------
     for p in old_rc + new_rc:
+        print(f"正在处理 {p.name} ...")
         kw = should_skip_special(p)
         if kw:
             print(f"⏩ 跳过【{p.name}】：表头含“{kw}”")
@@ -271,8 +491,42 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             df["来源文件"] = p.name
             dfs.append(df)
 
-    if not dfs:
-        return pd.DataFrame(columns=TEMPLATE_COLS)
+    # ----------- 泰隆银行 -----------
+
+    for p in tl_files:
+        if "开户" in p.stem:
+            continue
+        print(f"正在处理 {p.name} ...")
+
+        # === NEW: 读取整个工作簿的所有 sheet ===
+        # 先用 ExcelFile 拿到 sheet 名，再逐个读入，并用 _header_row 定位表头
+        xls = pd.ExcelFile(p)
+        xls_dict = {}
+        for sht in xls.sheet_names:
+            try:
+                header_idx = _header_row(p)
+                df_sheet   = pd.read_excel(p, sheet_name=sht, header=header_idx)
+                xls_dict[sht] = df_sheet
+            except Exception as e:
+                print("❌", f"{p.name} -> {sht}", e)
+
+        # === NEW: 交给多-sheet 版 tl_to_template 自动合并 ===
+        df = tl_to_template(xls_dict)
+
+        if not df.empty:
+            df["来源文件"] = p.name
+            dfs.append(df)
+    
+    # ----------- 民泰银行 -----------
+    for p in mt_files:
+        print(f"正在处理 {p.name} ...")
+        raw = _read_raw(p)
+        df  = mt_to_template(raw)
+        if not df.empty:
+            df["来源文件"] = p.name
+            dfs.append(df)
+    
+    print(f"文件读取已完成，正在整合分析！ ...")
 
     all_txn = pd.concat(dfs, ignore_index=True)
 
@@ -294,9 +548,9 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         if pd.isna(x):
             return x
         s = str(x).strip()
-        if s in {"1", "借"}:
+        if s in {"1", "借", "D"}:
             return "出"
-        if s in {"2", "贷"}:
+        if s in {"2", "贷", "C"}:
             return "进"
         return s
     all_txn["借贷标志"] = all_txn["借贷标志"].apply(_std_flag)
