@@ -499,8 +499,6 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             continue
         print(f"正在处理 {p.name} ...")
 
-        # === NEW: 读取整个工作簿的所有 sheet ===
-        # 先用 ExcelFile 拿到 sheet 名，再逐个读入，并用 _header_row 定位表头
         xls = pd.ExcelFile(p)
         xls_dict = {}
         for sht in xls.sheet_names:
@@ -511,7 +509,6 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             except Exception as e:
                 print("❌", f"{p.name} -> {sht}", e)
 
-        # === NEW: 交给多-sheet 版 tl_to_template 自动合并 ===
         df = tl_to_template(xls_dict)
 
         if not df.empty:
