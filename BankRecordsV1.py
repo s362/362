@@ -16,6 +16,14 @@ Author  : 温岭纪委六室 单柳昊   （2025-08-05 修订）
 - 星期/节假日基于已算好的时间戳一次性向量化生成（错误/NaT 标注保持一致）
 - 尽量减少 DataFrame copy 与重复类型转换
 - I/O 小优化（自动列宽逻辑保留，分支更精简）
+
+（2025-08-28+ 职务增强）
+- 自动读取目录内包含“通讯录”的Excel（多sheet），提取 姓名、主管部门名称、行政职务
+- “职务”= 主管部门名称-行政职务（缺一取一）
+- 与交易中的“交易对方姓名”匹配，输出“对方职务”到：
+  1) 所有人-合并交易流水.xlsx
+  2) 资金来源分析
+  3) 交易对手分析 / 与公司相关交易频次分析
 """
 
 import tkinter as tk
@@ -41,6 +49,9 @@ TEMPLATE_COLS = [
     "交易网点代码","日志号","传票号","凭证种类","凭证号","现金标志","终端号","交易是否成功",
     "交易发生地","商户名称","商户号","IP地址","MAC","交易柜员号","备注",
 ]
+
+# 新增：全局通讯录“姓名->职务”映射（供合并及分析阶段使用）
+CONTACT_TITLE_MAP: Dict[str, str] = {}
 
 # ------------------------------------------------------------------
 # ②   通用工具
@@ -589,10 +600,139 @@ def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame
     return out
 
 # ------------------------------------------------------------------
+# ⑤.5  通讯录读取与职务匹配（新增）
+# ------------------------------------------------------------------
+CONTACT_NAME_COLS = ["姓名", "联系人", "人员姓名", "姓名/名称"]
+DEPT_COLS = ["主管部门名称", "部门", "所属部门", "归属单位", "单位", "工作单位", "科室", "处室", "所属单位"]
+TITLE_COLS = ["行政职务", "岗位", "职称"]
+
+def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in df.columns:
+        cs = str(c).strip()
+        for key in candidates:
+            if key in cs:
+                return c
+    return None
+
+def _compose_title_str(dept: str, title: str) -> str:
+    """职务拼接规则：
+    - 两者都有：部门-行政职务
+    - 行政职务空白：仅部门
+    - 部门空白：仅行政职务
+    - 都空：空字符串
+    """
+    def _blank(x: Any) -> bool:
+        s = str(x).strip() if x is not None else ""
+        return s == "" or s.lower() in {"nan", "none"} or s in {"-", "—", "——", "无", "暂无"}
+    d = "" if _blank(dept) else str(dept).strip()
+    t = "" if _blank(title) else str(title).strip()
+
+    if d and t:
+        return f"{d}-{t}"
+    if t:
+        return t
+    if d:
+        return d
+    return ""
+
+def _read_one_contacts_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
+    # 先尝试直接读头，再退回扫描前10行找“姓名”
+    try:
+        df0 = xls.parse(sheet_name=sheet_name, header=0)
+        df0.columns = pd.Index(df0.columns).astype(str).str.strip()
+        if any("姓名" in c for c in df0.columns):
+            df = df0
+        else:
+            raise ValueError("未命中姓名列，尝试扫描表头")
+    except Exception:
+        head = xls.parse(sheet_name=sheet_name, header=None, nrows=10)
+        header_idx = 0
+        for i, row in head.iterrows():
+            if row.astype(str).str.contains("姓名").any():
+                header_idx = i
+                break
+        df = xls.parse(sheet_name=sheet_name, header=header_idx)
+        df.columns = pd.Index(df.columns).astype(str).str.strip()
+
+    name_col  = _find_first_col(df, CONTACT_NAME_COLS)
+    dept_col  = _find_first_col(df, DEPT_COLS)
+    title_col = _find_first_col(df, TITLE_COLS)
+    if not name_col:
+        return pd.DataFrame(columns=["姓名","职务"])
+
+    out = pd.DataFrame()
+    out["姓名"] = df[name_col].astype(str).str.strip()
+    dept = df[dept_col].astype(str) if dept_col in df else ""
+    titl = df[title_col].astype(str) if title_col in df else ""
+    if isinstance(dept, str): dept = pd.Series([dept]*len(out))
+    if isinstance(titl, str): titl = pd.Series([titl]*len(out))
+    out["职务"] = [_compose_title_str(d, t) for d, t in zip(dept, titl)]
+    out = out[(out["姓名"]!="") & (~out["姓名"].str.lower().eq("nan"))]
+    out["职务"] = out["职务"].replace({"nan":"","None":""})
+    out.drop_duplicates(inplace=True)
+    return out[["姓名","职务"]]
+
+def load_contacts_map(root: Path) -> Dict[str, str]:
+    files = [p for p in root.rglob("*通讯录*.xls*")]
+    if not files:
+        print("ℹ️ 未发现文件名包含“通讯录”的Excel。")
+        return {}
+
+    frames: List[pd.DataFrame] = []
+    for p in files:
+        try:
+            xls = pd.ExcelFile(p)
+        except Exception as e:
+            print("❌ 通讯录载入失败", p.name, e)
+            continue
+        for sht in xls.sheet_names:
+            try:
+                df = _read_one_contacts_sheet(xls, sht)
+                if not df.empty:
+                    df["来源文件"] = p.name
+                    df["来源sheet"] = sht
+                    frames.append(df)
+            except Exception as e:
+                print("❌ 通讯录解析失败", f"{p.name}->{sht}", e)
+
+    if not frames:
+        print("ℹ️ 通讯录中未解析出有效姓名/职务。")
+        return {}
+
+    allc = pd.concat(frames, ignore_index=True)
+    allc["姓名"] = allc["姓名"].astype(str).str.strip()
+    allc["职务"] = allc["职务"].astype(str).str.strip()
+
+    def _uniq_preserve(seq: List[str]) -> List[str]:
+        """去空去'nan'并按出现顺序去重"""
+        seen = set()
+        out: List[str] = []
+        for x in seq:
+            s = (x or "").strip()
+            if not s or s.lower() == "nan":
+                continue
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    # 同名多条 -> 合并成 '、' 分隔的一条
+    grouped = (allc.groupby("姓名")["职务"]
+                    .apply(lambda s: "、".join(_uniq_preserve(list(s)))))
+    mapping = grouped.to_dict()
+
+    print(f"✅ 已读取通讯录 {len(files)} 份，收录姓名 {len(mapping)} 条（同名已合并）。")
+    return mapping
+
+# ------------------------------------------------------------------
 # ⑥   合并全部流水
 # ------------------------------------------------------------------
 def merge_all_txn(root_dir: str) -> pd.DataFrame:
     root = Path(root_dir).expanduser().resolve()
+
+    # —— 新增：先加载通讯录（全局映射）
+    global CONTACT_TITLE_MAP
+    CONTACT_TITLE_MAP = load_contacts_map(root)
 
     china_files = [p for p in root.rglob("*-*-交易流水.xls*")]
 
@@ -770,6 +910,12 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     status.loc[~mask_valid] = "wrong"
     all_txn["节假日"] = status
 
+    # —— 新增：匹配通讯录，增加“对方职务”列
+    if CONTACT_TITLE_MAP:
+        all_txn["对方职务"] = all_txn["交易对方姓名"].map(CONTACT_TITLE_MAP).fillna("")
+    else:
+        all_txn["对方职务"] = ""
+
     save_df_auto_width(all_txn, "所有人-合并交易流水", index=False, engine="openpyxl")
     print("✅ 已导出 所有人-合并交易流水.xlsx")
     return all_txn
@@ -829,6 +975,10 @@ def analysis_txn(df: pd.DataFrame) -> None:
            .reset_index())
     total = src["流入额"].sum()
     src["流入比%"] = src["流入额"] / total * 100 if total else 0
+    # 新增：对方职务（来自通讯录映射）
+    if CONTACT_TITLE_MAP:
+        src.insert(1, "对方职务", src["交易对方姓名"].map(CONTACT_TITLE_MAP).fillna(""))
+
     src.sort_values("流入额", ascending=False, inplace=True)
     save_df_auto_width(src, f"{prefix}1{person}-资金来源分析", index=False, engine="openpyxl")
 
@@ -856,10 +1006,16 @@ def make_partner_summary(df: pd.DataFrame) -> None:
                    转出金额=("out_amt","sum"))
               .reset_index()
               .rename(columns={"查询对象":"姓名","交易对方姓名":"对方姓名"}))
+
+    # 新增：对方职务
+    if CONTACT_TITLE_MAP:
+        summ.insert(2, "对方职务", summ["对方姓名"].map(CONTACT_TITLE_MAP).fillna(""))
+
     total = summ.groupby("姓名")["交易金额"].transform("sum")
     summ["交易占比%"] = np.where(total>0, summ["交易金额"] / total * 100, 0)
     summ.sort_values(["姓名","交易金额"], ascending=[True, False], inplace=True)
     save_df_auto_width(summ, f"{prefix}2{person}-交易对手分析", index=False, engine="openpyxl")
+
     comp = summ[summ["对方姓名"].astype(str).str.contains("公司", na=False)]
     save_df_auto_width(comp, f"{prefix}3{person}-与公司相关交易频次分析", index=False, engine="openpyxl")
 
