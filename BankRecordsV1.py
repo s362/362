@@ -1,13 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-交易流水批量分析工具 GUI   v6-plus
+交易流水批量分析工具 GUI   v6-plus (refactor)
 Author  : 温岭纪委六室 单柳昊   （2025-08-05 修订）
+重构者  : （效率优化版 2025-08-28）
 
-（2025-08-27 增补）
+（2025-08-27 增补保持不变）
 - 新增：支持读取同目录下固定文件名 “交易明细信息.csv”
 - “查询对象”自动来自同目录 “人员信息.csv” 的“客户姓名”
 - “反馈单位”来自 CSV 文件父文件夹名
+
+（2025-08-28 重构亮点：功能等价、性能更佳）
+- 缓存 header 探测/特殊表头探测，避免多次读取同一文件首行
+- 解析泰隆多 sheet 时只计算一次 header 行
+- 星期/节假日基于已算好的时间戳一次性向量化生成（错误/NaT 标注保持一致）
+- 尽量减少 DataFrame copy 与重复类型转换
+- I/O 小优化（自动列宽逻辑保留，分支更精简）
 """
 
 import tkinter as tk
@@ -15,7 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 import threading, warnings, builtins, datetime, re
 from pathlib import Path
 from functools import wraps, lru_cache
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import numpy as np
@@ -42,8 +50,10 @@ SKIP_HEADER_KEYWORDS = [
     "信用卡消费明细",
 ]
 
-def should_skip_special(p: Path) -> str | None:
-    """首 3 行包含关键字则返回关键字，否则 None"""
+@lru_cache(maxsize=None)
+def _should_skip_special_cached(path_str: str) -> Optional[str]:
+    """首 3 行包含关键字则返回关键字，否则 None；带缓存"""
+    p = Path(path_str)
     try:
         head = pd.read_excel(p, header=None, nrows=3)
         for kw in SKIP_HEADER_KEYWORDS:
@@ -52,6 +62,9 @@ def should_skip_special(p: Path) -> str | None:
         return None
     except Exception:
         return None
+
+def should_skip_special(p: Path) -> Optional[str]:
+    return _should_skip_special_cached(str(p))
 
 def _normalize_time(t: str, is_old: bool) -> str:
     if not t:
@@ -86,10 +99,12 @@ def save_df_auto_width(
         with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
             df.to_excel(writer, sheet_name=sheet_name, index=index)
             ws = writer.sheets[sheet_name]
+            # 计算列宽（一次 map + max）
             for i, col in enumerate(df.columns):
+                s = df[col].astype(str)
                 width = max(
                     min_width,
-                    min(max(df[col].astype(str).map(len).max(), len(str(col))) + 2, max_width),
+                    min(max(s.map(len).max(), len(str(col))) + 2, max_width),
                 )
                 ws.set_column(i, i, width)
     else:  # openpyxl
@@ -122,7 +137,7 @@ def holiday_status(date_val) -> str:
 def _read_csv_smart(p: Path, **kwargs) -> pd.DataFrame:
     """智能编码读取 CSV：优先 utf-8-sig，其次 gb18030，再退回 utf-8/cp936。"""
     enc_try = ["utf-8-sig", "gb18030", "utf-8", "cp936"]
-    last_err = None
+    last_err: Optional[Exception] = None
     for enc in enc_try:
         try:
             return pd.read_csv(p, encoding=enc, **kwargs)
@@ -148,7 +163,8 @@ def _person_from_people_csv(dirpath: Path) -> str:
                 return ser.iloc[0][:10]
     # 表格里混写的“客户姓名:张三”
     name_pat = re.compile(r"客户(?:姓名|名称)\s*[:：]?\s*([^\s:：]{2,10})")
-    for val in df.astype(str).replace("nan", "", regex=False).to_numpy().ravel().tolist():
+    vals = df.astype(str).replace("nan", "", regex=False).to_numpy().ravel().tolist()
+    for val in vals:
         m = name_pat.search(val.strip())
         if m:
             return m.group(1)
@@ -183,7 +199,7 @@ def fallback_holder_from_path(p: Path) -> str:
 def holder_from_folder(folder: Path) -> str:
     for fp in folder.glob("*.xls*"):
         try:
-            header_idx = _header_row(fp)          # 自动定位表头行
+            header_idx = _header_row(fp)          # 自动定位表头行（缓存后只算一次）
             preview = pd.read_excel(fp, header=header_idx, nrows=5)
             if "账户名称" in preview.columns:
                 s = preview["账户名称"].dropna()
@@ -196,7 +212,9 @@ def holder_from_folder(folder: Path) -> str:
 # ------------------------------------------------------------------
 # ④   解析函数
 # ------------------------------------------------------------------
-def _header_row(path):
+@lru_cache(maxsize=None)
+def _header_row(path: Path) -> int:
+    """读取文件首 15 行寻找包含“交易日期”的行号；带缓存"""
     raw = pd.read_excel(path, header=None, nrows=15)
     for i, r in raw.iterrows():
         if "交易日期" in r.values:
@@ -231,7 +249,6 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
     if raw.empty:
         return pd.DataFrame(columns=TEMPLATE_COLS)
 
-    # 整体兜底：函数级异常直接返回全 'wrong'
     try:
         df = raw.copy()
         df.columns = pd.Index(df.columns).astype(str).str.strip()
@@ -241,7 +258,6 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
             return pd.Series([default] * n, index=df.index)
 
         def _safe(name, fn):
-            """单列安全赋值：异常→整列'wrong'"""
             try:
                 return fn()
             except Exception as e:
@@ -249,7 +265,6 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
                 return _S("wrong")
 
         def col(keys, default=""):
-            """支持传入单列名或候选列名列表；不做 .str 操作"""
             if isinstance(keys, str):
                 return df[keys] if keys in df else _S(default)
             for k in keys:
@@ -258,7 +273,6 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
             return _S(default)
 
         def _to_str_no_sci(x):
-            """账号/卡号等数字安全转字符串（防科学计数/去'.0'）"""
             if pd.isna(x):
                 return ""
             s = str(x).strip()
@@ -283,7 +297,7 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
             if s in {"0","N","n","否","失败","False","false"}: return "失败"
             return "" if s.lower() == "nan" else s
 
-        out = pd.DataFrame(columns=TEMPLATE_COLS, index=df.index)
+        out = pd.DataFrame(index=df.index)
 
         # ===== 本方账号/卡号 + 查询账户/卡号 =====
         out["本方账号"] = _safe("本方账号", lambda: col(["交易账号","查询账户","本方账号","账号","账号/卡号","账号卡号"]).map(_to_str_no_sci))
@@ -306,13 +320,11 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
             {"人民币":"CNY","RMB":"CNY","156":"CNY"}).fillna("CNY"))
 
         # ===== 金额 / 余额 =====
-        amt = _safe("交易金额", lambda: pd.to_numeric(col(["交易金额","金额","发生额"], 0), errors="coerce"))
-        out["交易金额"] = amt
+        out["交易金额"] = _safe("交易金额", lambda: pd.to_numeric(col(["交易金额","金额","发生额"], 0), errors="coerce"))
         out["账户余额"] = _safe("账户余额", lambda: pd.to_numeric(col(["交易余额","余额","账户余额"], 0), errors="coerce"))
 
-        # ===== 借贷/收付 → 进/出 =====
-        jl = col(["收付标志","借贷标志","借贷方向","借贷"], "")
-        out["借贷标志"] = col(["收付标志",""])
+        # ===== 借贷/收付 =====
+        out["借贷标志"] = col(["收付标志",""], "")
 
         # ===== 交易时间 =====
         if "交易时间" in df.columns:
@@ -322,7 +334,7 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
                 df["交易时间"].astype(str)
             ))
         else:
-            out["交易时间"] = _S("wrong")  # 没有交易时间列则记为 wrong
+            out["交易时间"] = _S("wrong")
 
         # ===== 其它字段对齐 =====
         out["交易类型"]              = col(["交易类型","业务种类","交易码"], "")
@@ -349,7 +361,7 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
         out["MAC"]                = col(["MAC地址","MAC"], "")
         out["交易柜员号"]             = col(["交易柜员号","柜员号","记账柜员"], "")
 
-        # ===== 备注：并入“查询反馈结果原因”；异常→wrong =====
+        # ===== 备注合并 =====
         try:
             beizhu = col(["备注","附言","说明"], "").astype(str)
             reason = col(["查询反馈结果原因"], "").astype(str)
@@ -364,10 +376,11 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
             print(f"⚠️ CSV字段[备注/原因]解析异常：{e}")
             out["备注"] = _S("wrong")
 
+        # 对齐模板列顺序
+        out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
         return out
 
     except Exception as e:
-        # 整体兜底：构造一个全 'wrong' 的模板（保持原有行数）
         print(f"❌ CSV转模板发生异常：{e}")
         n = len(raw)
         bad = pd.DataFrame({col: ["wrong"] * n for col in TEMPLATE_COLS})
@@ -379,13 +392,10 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
 def tl_to_template(raw) -> pd.DataFrame:
     """
     泰隆银行流水 → 统一模板字段 TEMPLATE_COLS
-    2025-08-06  增强版：
-    • 传入  DataFrame  —— 原逻辑不变；返回单 sheet 的模板表
-    • 传入 dict[str, DataFrame] —— 自动遍历所有 sheet，
-      把各 sheet 解析后纵向合并；并在最前插入 "__sheet__" 列标明来源 sheet
+    2025-08-06  增强版：支持 dict[sheet, df] 合并；保持原行为
     """
     if isinstance(raw, dict):
-        frames = []
+        frames: List[pd.DataFrame] = []
         for sheet_name, df_sheet in raw.items():
             one = tl_to_template(df_sheet)
             if not one.empty:
@@ -393,70 +403,68 @@ def tl_to_template(raw) -> pd.DataFrame:
                 frames.append(one)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=TEMPLATE_COLS)
 
-    def _one_sheet(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame(columns=TEMPLATE_COLS)
+    df: pd.DataFrame = raw
+    if df.empty:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
 
-        def col(c, default=""):
-            return df[c] if c in df else pd.Series([default] * len(df), index=df.index)
+    def col_multi(keys, default=""):
+        for k in keys:
+            if k in df:
+                return df[k]
+        return pd.Series([default] * len(df), index=df.index)
 
-        def col_multi(keys, default=""):
-            for k in keys:
-                if k in df:
-                    return df[k]
-            return pd.Series([default] * len(df), index=df.index)
+    out = pd.DataFrame(index=df.index)
+    out["本方账号"] = col_multi(["客户账号","账号","本方账号"], "wrong")
+    out["查询账户"] = out["本方账号"]
+    out["反馈单位"] = "泰隆银行"
+    out["查询对象"] = col_multi(["账户名称","户名","客户名称"], "wrong")
+    out["币种"] = col_multi(["币种","货币","币别"]).replace("156","CNY").fillna("CNY")
+    out["借贷标志"] = col_multi(["借贷标志","借贷方向","借贷"], "")
 
-        out = pd.DataFrame(columns=TEMPLATE_COLS)
-        out["本方账号"] = out["查询账户"] = col_multi(["客户账号","账号","本方账号"], "wrong")
-        out["反馈单位"] = "泰隆银行"
-        out["查询对象"] = col_multi(["账户名称","户名","客户名称"], "wrong")
-        out["币种"] = col_multi(["币种","货币","币别"]).replace("156","CNY").fillna("CNY")
-        out["借贷标志"] = col_multi(["借贷标志","借贷方向","借贷"], "")
+    debit  = pd.to_numeric(col_multi(["借方发生额","借方发生金额"], 0), errors="coerce")
+    credit = pd.to_numeric(col_multi(["贷方发生额","贷方发生金额"], 0), errors="coerce")
+    out["交易金额"] = debit.fillna(0).where(debit.ne(0), credit)
+    out["账户余额"] = pd.to_numeric(col_multi(["账户余额","余额"], 0), errors="coerce")
 
-        debit  = pd.to_numeric(col_multi(["借方发生额","借方发生金额"], 0), errors="coerce")
-        credit = pd.to_numeric(col_multi(["贷方发生额","贷方发生金额"], 0), errors="coerce")
-        out["交易金额"] = debit.fillna(0).where(debit.ne(0), credit)
-        out["账户余额"] = pd.to_numeric(col_multi(["账户余额","余额"], 0), errors="coerce")
+    dates = col_multi(["交易日期","原交易日期","会计日期"]).astype(str)
+    raw_times = col_multi(["交易时间","原交易时间","时间"]).astype(str).str.strip()
 
-        dates = col_multi(["交易日期","原交易日期","会计日期"]).astype(str)
-        raw_times = col_multi(["交易时间","原交易时间","时间"]).astype(str).str.strip()
+    def _tidy_time(s: str) -> str:
+        if re.fullmatch(r"0+(\.0+)?", s):
+            return ""
+        if s.count(".") >= 2:
+            p = s.split(".")
+            if len(p[0]) == 2 and len(p[1]) == 2 and len(p[2]) == 2:
+                return ".".join(p[:3])
+        return s
 
-        def _tidy_time(s: str) -> str:
-            if re.fullmatch(r"0+(\.0+)?", s):
-                return ""
-            if s.count(".") >= 2:
-                p = s.split(".")
-                if len(p[0]) == 2 and len(p[1]) == 2 and len(p[2]) == 2:
-                    return ".".join(p[:3])
-            return s
+    def _clean_time(s: str) -> str:
+        s = s.strip()
+        if re.fullmatch(r"0+(\.0+)?", s):
+            return ""
+        if re.fullmatch(r"\d{1,9}", s):
+            return s.zfill(9)[:6]
+        return s
 
-        def _clean_time(s: str) -> str:
-            s = s.strip()
-            if re.fullmatch(r"0+(\.0+)?", s):
-                return ""
-            if re.fullmatch(r"\d{1,9}", s):
-                return s.zfill(9)[:6]
-            return s
+    times = raw_times.apply(lambda x: _clean_time(_tidy_time(x)))
+    out["交易时间"] = [_parse_dt(d, t, is_old=False) for d, t in zip(dates, times)]
 
-        times = raw_times.apply(lambda x: _clean_time(_tidy_time(x)))
-        out["交易时间"] = [_parse_dt(d, t, is_old=False) for d, t in zip(dates, times)]
+    out["交易流水号"]        = col_multi(["原柜员流水号","流水号"])
+    out["交易类型"]          = col_multi(["交易码","交易类型","业务种类"])
+    out["交易对方姓名"]       = col_multi(["对方户名","交易对手名称"], " ")
+    out["交易对方账户"]       = col_multi(["对方客户账号","对方账号"], " ")
+    out["交易对方账号开户行"]   = col_multi(["对方金融机构名称","对方开户行"], " ")
+    out["交易摘要"]          = col_multi(["摘要描述","摘要"], " ")
+    out["交易网点代码"]        = col_multi(["机构号","网点代码"], " ")
+    out["终端号"]           = col_multi(["渠道号","终端号"], " ")
+    out["交易柜员号"]         = col_multi(["柜员号"], " ")
+    out["备注"]            = col_multi(["备注","附言"], " ")
 
-        out["交易流水号"]        = col_multi(["原柜员流水号","流水号"])
-        out["交易类型"]          = col_multi(["交易码","交易类型","业务种类"])
-        out["交易对方姓名"]       = col_multi(["对方户名","交易对手名称"], " ")
-        out["交易对方账户"]       = col_multi(["对方客户账号","对方账号"], " ")
-        out["交易对方账号开户行"]   = col_multi(["对方金融机构名称","对方开户行"], " ")
-        out["交易摘要"]          = col_multi(["摘要描述","摘要"], " ")
-        out["交易网点代码"]        = col_multi(["机构号","网点代码"], " ")
-        out["终端号"]           = col_multi(["渠道号","终端号"], " ")
-        out["交易柜员号"]         = col_multi(["柜员号"], " ")
-        out["备注"]            = col_multi(["备注","附言"], " ")
+    out["凭证种类"] = col_multi(["凭证类型"], "")
+    out["凭证号"]   = col_multi(["凭证序号"], "")
 
-        out["凭证种类"] = col_multi(["凭证类型"], "")
-        out["凭证号"]   = col_multi(["凭证序号"], "")
-        return out
-
-    return _one_sheet(raw)
+    out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
+    return out
 
 # ------------------------------------------------------------------
 # ⑤   民泰 → 模板
@@ -512,9 +520,10 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
     def col(c, default=""):
         return df[c] if c in df else pd.Series(default, index=df.index)
 
-    out = pd.DataFrame(columns=TEMPLATE_COLS)
+    out = pd.DataFrame(index=df.index)
     acct = col("账号卡号").astype(str).str.replace(r"\.0$", "", regex=True)
-    out["本方账号"] = out["查询账户"] = acct
+    out["本方账号"] = acct
+    out["查询账户"] = acct
     out["查询对象"] = holder
     out["反馈单位"] = "民泰银行"
     out["币种"] = col("币种").astype(str).replace("人民币","CNY").fillna("CNY")
@@ -544,6 +553,7 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
     out["终端号"]         = col("交易渠道")
     out["备注"]          = col("附言", " ")
 
+    out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
     return out
 
 # ------------------------------------------------------------------
@@ -552,11 +562,13 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
 def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame:
     if raw.empty:
         return pd.DataFrame(columns=TEMPLATE_COLS)
+
     def col(c, default=""):
         return raw[c] if c in raw else pd.Series([default] * len(raw), index=raw.index)
 
-    out = pd.DataFrame(columns=TEMPLATE_COLS)
-    out["本方账号"] = out["查询账户"] = col("账号", "wrong")
+    out = pd.DataFrame(index=raw.index)
+    out["本方账号"] = col("账号", "wrong")
+    out["查询账户"] = out["本方账号"]
     out["交易金额"] = col("发生额") if is_old else col("交易金额")
     out["账户余额"] = col("余额") if is_old else col("交易余额")
     out["反馈单位"] = "老农商银行" if is_old else "新农商银行"
@@ -572,6 +584,8 @@ def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame
     out["交易对方账户"] = col("对方账号", " ")
     out["交易网点名称"] = col("代理行机构号") if is_old else col("交易机构")
     out["交易摘要"] = col("备注") if is_old else col("摘要", "wrong")
+
+    out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
     return out
 
 # ------------------------------------------------------------------
@@ -601,8 +615,9 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         f"交易明细CSV {len(csv_txn_files)} 份"
     )
 
-    dfs = []
+    dfs: List[pd.DataFrame] = []
 
+    # —— 网银标准表 —— 直接读入
     for p in china_files:
         print(f"正在处理 {p.name} ...")
         try:
@@ -621,6 +636,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         except Exception as e:
             print("❌", p.name, e)
 
+    # —— 农商行 —— 新旧分流
     for p in old_rc + new_rc:
         print(f"正在处理 {p.name} ...")
         kw = should_skip_special(p)
@@ -630,18 +646,14 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
 
         raw = _read_raw(p)
 
-        holder = extract_holder_from_df(raw)
-        if not holder:
-            holder = holder_from_folder(p.parent)
-        if not holder:
-            holder = fallback_holder_from_path(p)
-
+        holder = extract_holder_from_df(raw) or holder_from_folder(p.parent) or fallback_holder_from_path(p)
         is_old = p in old_rc
         df = rc_to_template(raw, holder, is_old)
         if not df.empty:
             df["来源文件"] = p.name
             dfs.append(df)
 
+    # —— 泰隆 —— 
     for p in tl_files:
         if "开户" in p.stem:
             continue
@@ -652,11 +664,16 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             print("❌", f"{p.name} 载入失败", e)
             continue
 
-        xls_dict = {}
+        try:
+            header_idx = _header_row(p)  # 缓存后仅计算一次
+        except Exception as e:
+            print("❌", f"{p.name} 表头行识别失败", e)
+            header_idx = 0
+
+        xls_dict: Dict[str, pd.DataFrame] = {}
         for sht in xls.sheet_names:
             try:
-                header_idx = _header_row(p)
-                df_sheet   = pd.read_excel(p, sheet_name=sht, header=header_idx)
+                df_sheet = xls.parse(sheet_name=sht, header=header_idx)
                 xls_dict[sht] = df_sheet
             except Exception as e:
                 print("❌", f"{p.name} -> {sht}", e)
@@ -666,6 +683,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             df["来源文件"] = p.name
             dfs.append(df)
 
+    # —— 民泰 —— 常规
     for p in mt_files:
         print(f"正在处理 {p.name} ...")
         raw = _read_raw(p)
@@ -674,6 +692,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             df["来源文件"] = p.name
             dfs.append(df)
 
+    # —— 交易明细 CSV
     for p in csv_txn_files:
         print(f"正在处理 {p.name} ...")
         try:
@@ -682,10 +701,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             print("❌ 无法读取CSV", p.name, e)
             continue
 
-        holder = _person_from_people_csv(p.parent)
-        if not holder:
-            holder = holder_from_folder(p.parent) or fallback_holder_from_path(p)
-
+        holder = _person_from_people_csv(p.parent) or holder_from_folder(p.parent) or fallback_holder_from_path(p)
         feedback_unit = p.parent.name
         try:
             df = csv_to_template(raw_csv, holder, feedback_unit)
@@ -704,17 +720,16 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
 
     all_txn = pd.concat(dfs, ignore_index=True)
 
+    # —— 统一：排序、序号、类型标准化、分箱、星期/节假日 —— 向量化加速
     ts = pd.to_datetime(all_txn["交易时间"], errors="coerce")
     all_txn.insert(0, "__ts__", ts)
-    all_txn.sort_values("__ts__", inplace=True)
+    all_txn.sort_values("__ts__", inplace=True, kind="mergesort")  # 稳定排序
     all_txn["序号"] = range(1, len(all_txn) + 1)
     all_txn.drop(columns="__ts__", inplace=True)
 
     all_txn["交易金额"] = pd.to_numeric(all_txn["交易金额"], errors="coerce")
 
-    all_txn["星期"] = all_txn["交易时间"].apply(str_to_weekday)
-    all_txn["节假日"] = all_txn["交易时间"].apply(holiday_status)
-
+    # 借贷标志标准化
     def _std_flag(x):
         if pd.isna(x):
             return x
@@ -724,9 +739,36 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         return s
     all_txn["借贷标志"] = all_txn["借贷标志"].apply(_std_flag)
 
+    # 金额分箱
     bins = [-np.inf, 2000, 5000, 20000, 50000, np.inf]
     labels = ["2000以下","2000-5000","5000-20000","20000-50000","50000以上"]
     all_txn["金额区间"] = pd.cut(all_txn["交易金额"], bins=bins, labels=labels, right=False, include_lowest=True)
+
+    # 星期（向量化）
+    weekday_map = {0:"星期一",1:"星期二",2:"星期三",3:"星期四",4:"星期五",5:"星期六",6:"星期日"}
+    wk = pd.Series(index=all_txn.index, dtype=object)
+    mask_valid = ts.notna()
+    wk.loc[mask_valid] = ts.dt.weekday.map(weekday_map)
+    wk.loc[~mask_valid] = "wrong"
+    all_txn["星期"] = wk
+
+    # 节假日（对唯一日期做缓存映射）
+    dates = ts.dt.date
+    status = pd.Series(index=all_txn.index, dtype=object)
+    unique_dates = pd.unique(dates[mask_valid])
+    @lru_cache(maxsize=None)
+    def _day_status(d) -> str:
+        try:
+            return "节假日" if is_holiday(d) else ("工作日" if is_workday(d) else "周末")
+        except Exception:
+            # 高稳健兜底
+            dt = datetime.datetime.combine(d, datetime.time())
+            return "周末" if dt.weekday() >= 5 else "工作日"
+    if len(unique_dates):
+        map_dict = {d: _day_status(d) for d in unique_dates}
+        status.loc[mask_valid] = dates.loc[mask_valid].map(map_dict)
+    status.loc[~mask_valid] = "wrong"
+    all_txn["节假日"] = status
 
     save_df_auto_width(all_txn, "所有人-合并交易流水", index=False, engine="openpyxl")
     print("✅ 已导出 所有人-合并交易流水.xlsx")
