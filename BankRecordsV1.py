@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-交易流水批量分析工具 GUI   v6-plus (refactor)
+交易流水批量分析工具 GUI   v6-plus (refactor + 线下银行扩展)
 Author  : 温岭纪委六室 单柳昊   （2025-08-05 修订）
 重构者  : （效率优化版 2025-08-28）
+扩展者  : （线下农行/建行接入 2025-09-09）
 
 （2025-08-27 增补保持不变）
 - 新增：支持读取同目录下固定文件名 “交易明细信息.csv”
@@ -24,6 +25,13 @@ Author  : 温岭纪委六室 单柳昊   （2025-08-05 修订）
   1) 所有人-合并交易流水.xlsx
   2) 资金来源分析
   3) 交易对手分析 / 与公司相关交易频次分析
+
+（2025-09-09 线下银行扩展）
+- 新增接入：农业银行线下（识别 APSH sheet）
+- 新增接入：建设银行线下（识别 “交易明细” sheet）
+
+（2025-09-09+ 数据质量增强）
+- 三键去重：若【交易流水号 + 交易时间 + 交易金额】完全一致，自动去重
 """
 
 import tkinter as tk
@@ -328,7 +336,7 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
         out["查询对象"] = holder or "未知"
         out["反馈单位"] = feedback_unit or "未知"
         out["币种"] = _safe("币种", lambda: col(["交易币种","币种","币别","货币"], "CNY").astype(str).replace(
-            {"人民币":"CNY","RMB":"CNY","156":"CNY"}).fillna("CNY"))
+            {"人民币":"CNY","人民币元":"CNY","RMB":"CNY","156":"CNY"}).fillna("CNY"))
 
         # ===== 金额 / 余额 =====
         out["交易金额"] = _safe("交易金额", lambda: pd.to_numeric(col(["交易金额","金额","发生额"], 0), errors="coerce"))
@@ -429,7 +437,7 @@ def tl_to_template(raw) -> pd.DataFrame:
     out["查询账户"] = out["本方账号"]
     out["反馈单位"] = "泰隆银行"
     out["查询对象"] = col_multi(["账户名称","户名","客户名称"], "wrong")
-    out["币种"] = col_multi(["币种","货币","币别"]).replace("156","CNY").fillna("CNY")
+    out["币种"] = col_multi(["币种","货币","币别"]).replace("156","CNY").replace("人民币元","CNY").replace("人民币","CNY").fillna("CNY")
     out["借贷标志"] = col_multi(["借贷标志","借贷方向","借贷"], "")
 
     debit  = pd.to_numeric(col_multi(["借方发生额","借方发生金额"], 0), errors="coerce")
@@ -537,7 +545,7 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
     out["查询账户"] = acct
     out["查询对象"] = holder
     out["反馈单位"] = "民泰银行"
-    out["币种"] = col("币种").astype(str).replace("人民币","CNY").fillna("CNY")
+    out["币种"] = col("币种").astype(str).replace("人民币","CNY").replace("人民币元","CNY").fillna("CNY")
 
     debit  = pd.to_numeric(col("支出"), errors="coerce").fillna(0)
     credit = pd.to_numeric(col("收入"), errors="coerce").fillna(0)
@@ -589,13 +597,281 @@ def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame
     out["交易时间"] = [_parse_dt(d, t, is_old) for d, t in zip(dates, times)]
 
     out["借贷标志"] = col("借贷标志")
-    out["币种"] = "CNY" if is_old else col("币种").replace("人民币","CNY")
+    out["币种"] = "CNY" if is_old else col("币种").replace("人民币","CNY").replace("人民币元","CNY")
     out["查询对象"] = holder
     out["交易对方姓名"] = col("对方姓名", " ")
     out["交易对方账户"] = col("对方账号", " ")
     out["交易网点名称"] = col("代理行机构号") if is_old else col("交易机构")
     out["交易摘要"] = col("备注") if is_old else col("摘要", "wrong")
 
+    out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
+    return out
+
+# ===============================
+# ⑤.8  农业银行线下（APSH） → 模板（合并 yyyymmdd + HHMMSS）
+# ===============================
+def _is_abc_offline_file(p: Path) -> bool:
+    """是否为农行线下查询格式：含 APSH sheet。"""
+    try:
+        xls = pd.ExcelFile(p)
+        return "APSH" in xls.sheet_names
+    except Exception:
+        return False
+
+def _merge_abc_datetime(date_val, time_val) -> str:
+    """
+    将 yyyymmdd 与 时间(无连接符 HHMMSS，或 13:31:20，或 Excel 小数时间，或空) 合并为 'YYYY-MM-DD HH:MM:SS'。
+    规则：
+      - 交易时间为空/NaN/空字符串 => 00:00:00
+      - 交易时间为 Excel 小数(0~1) => 按一天的秒数换算
+      - 纯数字长度<6 左补零，>6 取前 6 位
+      - 示例：20100113 + 133120 -> 2010-01-13 13:31:20
+    """
+    # ---- 日期处理 ----
+    ds_raw = "" if date_val is None else str(date_val).strip()
+    ds_digits = re.sub(r"\D", "", ds_raw)
+    date_ts = None
+    if len(ds_digits) >= 8:
+        ds8 = ds_digits[:8]
+        date_ts = pd.to_datetime(ds8, format="%Y%m%d", errors="coerce")
+    else:
+        # 兜底：直接尝试解析
+        date_ts = pd.to_datetime(date_val, errors="coerce")
+    if pd.isna(date_ts):
+        return "wrong"
+    date_str = date_ts.strftime("%Y-%m-%d")
+
+    # ---- 时间处理：统一得到 'HHMMSS' 的 6 位字符串 ----
+    def to_hhmmss_str(t) -> str:
+        # 空、NaN、None -> 00:00:00
+        if t is None or (isinstance(t, float) and np.isnan(t)) or (isinstance(t, str) and t.strip() == "") or pd.isna(t):
+            return "000000"
+
+        # Excel 小数时间（0~1）
+        if isinstance(t, (int, np.integer)) or isinstance(t, (float, np.floating)):
+            try:
+                tf = float(t)
+                if 0.0 <= tf < 1.0:
+                    secs = int(round(tf * 86400))
+                    if secs >= 86400:
+                        secs = 0  # 极端四舍五入到 24:00:00，当作 00:00:00
+                    h = secs // 3600
+                    m = (secs % 3600) // 60
+                    s = secs % 60
+                    return f"{h:02d}{m:02d}{s:02d}"
+                # 常见：133120.0 / 93120.0
+                digits = re.sub(r"\D", "", str(int(round(tf))))
+                if len(digits) < 6:
+                    digits = digits.zfill(6)
+                else:
+                    digits = digits[:6]
+                return digits
+            except Exception:
+                pass
+
+        # 字符串：可能是 '13:31:20' / '13.31.20' / '133120' / '93120'
+        s = str(t).strip()
+        # 带分隔符的情况，尝试按时间解析
+        if ":" in s or "." in s:
+            s2 = s.replace(".", ":")
+            tt = pd.to_datetime("2000-01-01 " + s2, errors="coerce")
+            if pd.notna(tt):
+                return tt.strftime("%H%M%S")
+        # 纯提取数字
+        digits = re.sub(r"\D", "", s)
+        if digits == "":
+            return "000000"
+        if len(digits) < 6:
+            digits = digits.zfill(6)
+        else:
+            digits = digits[:6]
+        return digits
+
+    hhmmss = to_hhmmss_str(time_val)
+    hh, mm, ss = hhmmss[:2], hhmmss[2:4], hhmmss[4:6]
+    return f"{date_str} {hh}:{mm}:{ss}"
+
+def abc_offline_from_file(p: Path) -> pd.DataFrame:
+    """
+    农业银行线下查询（APSH）流水 → 统一模板字段 TEMPLATE_COLS
+    适配列（常见）：账号、交易日期(yyyymmdd)、交易时间(HHMMSS，无连接符)、卡号、户名、传票号、交易网点、交易金额、交易后余额、
+             摘要、交易渠道、对方账号、对方户名、对方开户行、交易行号
+    —— 本函数将【交易日期 + 交易时间】合并生成标准“交易时间(YYYY-MM-DD HH:MM:SS)”。
+    """
+    try:
+        xls = pd.ExcelFile(p)
+        if "APSH" not in xls.sheet_names:
+            return pd.DataFrame(columns=TEMPLATE_COLS)
+        df = xls.parse("APSH", header=0)
+    except Exception:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    if df.empty:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    # 列名清洗
+    df.columns = pd.Index(df.columns).astype(str).str.strip()
+    n = len(df)
+    out = pd.DataFrame(index=df.index)
+
+    # 本方/查询账号卡号
+    out["本方账号"] = df.get("账号", "")
+    out["本方卡号"] = df.get("卡号", "").astype(str).str.replace(r"\.0$", "", regex=True)
+    out["查询账户"] = out["本方账号"]
+    out["查询卡号"] = out["本方卡号"]
+
+    # 查询对象/反馈单位/币种
+    holder = df.get("户名", "")
+    if not isinstance(holder, pd.Series):
+        holder = pd.Series([holder]*n, index=df.index)
+    out["查询对象"] = holder.fillna("").astype(str).str.strip().replace({"nan": ""}).replace("", "未知")
+    out["反馈单位"] = "农业银行"
+    out["币种"] = "CNY"
+
+    # 金额/余额/借贷标志（按正负号判断）
+    amt = pd.to_numeric(df.get("交易金额", 0), errors="coerce")
+    out["交易金额"] = amt
+    out["账户余额"] = pd.to_numeric(df.get("交易后余额", ""), errors="coerce")
+    out["借贷标志"] = np.where(amt > 0, "进", np.where(amt < 0, "出", ""))
+
+    # === 交易时间：合并 yyyymmdd + HHMMSS（无连接符） ===
+    dates = df.get("交易日期", "")
+    times = df.get("交易时间", "")
+    out["交易时间"] = [_merge_abc_datetime(d, t) for d, t in zip(dates, times)]
+
+    # 其它字段对齐
+    out["交易摘要"] = df.get("摘要", "").astype(str)
+    out["交易流水号"] = ""  # APSH 多无此字段
+    out["交易类型"] = ""    # 可根据需要由 摘要/渠道 推断；此处留空
+    out["交易对方姓名"] = df.get("对方户名", " ").astype(str)
+    out["交易对方账户"] = df.get("对方账号", " ").astype(str)
+    out["交易对方卡号"] = ""
+    out["交易对方证件号码"] = " "
+    out["交易对手余额"] = ""
+    out["交易对方账号开户行"] = df.get("对方开户行", " ").astype(str)
+    out["交易网点名称"] = df.get("交易网点", "").astype(str)
+    out["交易网点代码"] = df.get("交易行号", "").astype(str)
+    out["日志号"] = ""
+    out["传票号"] = df.get("传票号", "").astype(str)
+    out["凭证种类"] = ""
+    out["凭证号"] = ""
+    out["现金标志"] = ""
+    out["终端号"] = df.get("交易渠道", "").astype(str)
+    out["交易是否成功"] = ""
+    out["交易发生地"] = ""
+    out["商户名称"] = ""
+    out["商户号"] = ""
+    out["IP地址"] = ""
+    out["MAC"] = ""
+    out["交易柜员号"] = ""
+    out["备注"] = ""
+
+    # 模板列顺序
+    out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
+    return out
+
+# ===============================
+# ⑤.9  建设银行线下（交易明细） → 模板（新增）
+# ===============================
+def _is_ccb_offline_file(p: Path) -> bool:
+    """
+    粗识别建设银行线下：存在名为“交易明细”的sheet，且包含关键字段。
+    """
+    try:
+        xls = pd.ExcelFile(p)
+        if "交易明细" not in xls.sheet_names:
+            return False
+        # 取头一行看列名是否含关键字段
+        df_head = xls.parse("交易明细", nrows=1)
+        cols = set(map(str, df_head.columns))
+        required = {"客户名称", "账号", "交易日期", "交易时间", "交易金额"}
+        return required.issubset(cols)
+    except Exception:
+        return False
+
+def ccb_offline_from_file(p: Path) -> pd.DataFrame:
+    """
+    建设银行线下（交易明细） → 统一模板字段
+    适配列：客户名称、账号、交易日期、交易时间、交易卡号、摘要、借贷方向、交易金额、账户余额、
+          柜员号、交易机构号、交易机构名称、对方账号、对方户名、对方行名、交易流水号、交易渠道、
+          自助设备编号、扩充备注、IP地址、MAC地址、第三方订单号、商户号、商户名称
+    """
+    try:
+        xls = pd.ExcelFile(p)
+        if "交易明细" not in xls.sheet_names:
+            return pd.DataFrame(columns=TEMPLATE_COLS)
+        df = xls.parse("交易明细", header=0)
+    except Exception:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    if df.empty:
+        return pd.DataFrame(columns=TEMPLATE_COLS)
+
+    df.columns = pd.Index(df.columns).astype(str).str.strip()
+    out = pd.DataFrame(index=df.index)
+
+    # 基本字段
+    out["本方账号"] = df.get("账号", "")
+    out["本方卡号"] = df.get("交易卡号", "").astype(str).str.replace(r"\.0$", "", regex=True)
+    out["查询账户"] = out["本方账号"]
+    out["查询卡号"] = out["本方卡号"]
+
+    out["查询对象"] = df.get("客户名称", "").astype(str).replace({"nan":""}).replace("", "未知")
+    out["反馈单位"] = "建设银行"
+    out["币种"] = df.get("币种", "CNY").astype(str).replace({"人民币":"CNY","人民币元":"CNY","RMB":"CNY","156":"CNY"}).fillna("CNY")
+
+    amt = pd.to_numeric(df.get("交易金额", 0), errors="coerce")
+    out["交易金额"] = amt
+    out["账户余额"] = pd.to_numeric(df.get("账户余额", ""), errors="coerce")
+
+    # 借贷方向：借->出，贷->进
+    jd = df.get("借贷方向", "").astype(str).str.strip()
+    out["借贷标志"] = np.where(jd.str.contains("^贷", na=False) | jd.str.upper().isin(["贷","C","CR","CREDIT"]), "进",
+                        np.where(jd.str.contains("^借", na=False) | jd.str.upper().isin(["借","D","DR","DEBIT"]), "出",
+                                 np.where(amt>0, "进", np.where(amt<0, "出", ""))))
+
+    # 时间
+    dates = df.get("交易日期", "")
+    times = df.get("交易时间", "")
+    times_str = pd.Series(times).astype(str).str.replace(r"\.0$", "", regex=True)
+    out["交易时间"] = [_parse_dt(d, t, is_old=False) for d, t in zip(dates, times_str)]
+
+    # 其它映射
+    out["交易摘要"] = df.get("摘要", " ").astype(str)
+    out["交易类型"] = ""  # 保留空位（如需由摘要/渠道二次推断可自行扩展）
+    out["交易流水号"] = df.get("交易流水号", "").astype(str)
+
+    out["交易对方姓名"] = df.get("对方户名", " ").astype(str)
+    out["交易对方账户"] = df.get("对方账号", " ").astype(str)
+    out["交易对方卡号"] = ""
+    out["交易对方证件号码"] = " "
+    out["交易对手余额"] = ""
+    out["交易对方账号开户行"] = df.get("对方行名", " ").astype(str)
+
+    out["交易网点名称"] = df.get("交易机构名称", "").astype(str)
+    out["交易网点代码"] = df.get("交易机构号", "").astype(str)
+    out["交易柜员号"] = df.get("柜员号", "").astype(str)
+
+    out["终端号"] = df.get("交易渠道", "").astype(str)  # 常见形态：渠道代码
+    # 其它可用补充信息 → 备注
+    ext = df.get("扩充备注", "").astype(str).replace({"nan":""})
+    out["备注"] = ext
+
+    out["现金标志"] = ""
+    out["日志号"] = ""
+    out["传票号"] = ""
+    out["凭证种类"] = ""
+    out["凭证号"] = ""
+
+    out["交易是否成功"] = ""
+    out["交易发生地"] = ""
+
+    out["商户名称"] = df.get("商户名称", "").astype(str)
+    out["商户号"] = df.get("商户号", "").astype(str)
+    out["IP地址"] = df.get("IP地址", "").astype(str)
+    out["MAC"] = df.get("MAC地址", "").astype(str)
+
+    # 对齐模板
     out = out.reindex(columns=TEMPLATE_COLS, fill_value="")
     return out
 
@@ -615,12 +891,7 @@ def _find_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def _compose_title_str(dept: str, title: str) -> str:
-    """职务拼接规则：
-    - 两者都有：部门-行政职务
-    - 行政职务空白：仅部门
-    - 部门空白：仅行政职务
-    - 都空：空字符串
-    """
+    """职务拼接规则：部门-行政职务；缺一取一；都空则空"""
     def _blank(x: Any) -> bool:
         s = str(x).strip() if x is not None else ""
         return s == "" or s.lower() in {"nan", "none"} or s in {"-", "—", "——", "无", "暂无"}
@@ -745,6 +1016,10 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     tl_files = [p for p in all_excel if "泰隆" in p.as_posix()]
     mt_files = [p for p in all_excel if "民泰" in p.as_posix()]
 
+    # —— 新增：农行线下（APSH）、建行线下（交易明细）
+    abc_offline_files = [p for p in all_excel if _is_abc_offline_file(p)]
+    ccb_offline_files = [p for p in all_excel if _is_ccb_offline_file(p)]
+
     csv_txn_files = [p for p in root.rglob("交易明细信息.csv")]
 
     print(
@@ -752,6 +1027,8 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         f"老农商 {len(old_rc)} 份，新农商 {len(new_rc)} 份，"
         f"泰隆银行 {len(tl_files)} 份，"
         f"民泰银行 {len(mt_files)} 份，"
+        f"农行线下 {len(abc_offline_files)} 份，"
+        f"建行线下 {len(ccb_offline_files)} 份，"
         f"交易明细CSV {len(csv_txn_files)} 份"
     )
 
@@ -832,6 +1109,28 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             df["来源文件"] = p.name
             dfs.append(df)
 
+    # —— 农行线下 —— APSH
+    for p in abc_offline_files:
+        print(f"正在处理 {p.name} ...")
+        try:
+            df = abc_offline_from_file(p)
+            if not df.empty:
+                df["来源文件"] = p.name
+                dfs.append(df)
+        except Exception as e:
+            print("❌ 农行线下解析失败", p.name, e)
+
+    # —— 建行线下 —— 交易明细
+    for p in ccb_offline_files:
+        print(f"正在处理 {p.name} ...")
+        try:
+            df = ccb_offline_from_file(p)
+            if not df.empty:
+                df["来源文件"] = p.name
+                dfs.append(df)
+        except Exception as e:
+            print("❌ 建行线下解析失败", p.name, e)
+
     # —— 交易明细 CSV
     for p in csv_txn_files:
         print(f"正在处理 {p.name} ...")
@@ -859,6 +1158,15 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         return pd.DataFrame(columns=TEMPLATE_COLS)
 
     all_txn = pd.concat(dfs, ignore_index=True)
+
+    # —— 新增：三键去重（交易流水号 + 交易时间 + 交易金额）
+    # 说明：为避免因金额格式差异导致的“假不同”，将金额先转为数值并保留两位小数再去重
+    all_txn["交易金额"] = pd.to_numeric(all_txn["交易金额"], errors="coerce").round(2)
+    before = len(all_txn)
+    all_txn = all_txn.drop_duplicates(subset=["交易流水号", "交易时间", "交易金额"], keep="first").reset_index(drop=True)
+    removed = before - len(all_txn)
+    if removed:
+        print(f"🧹 已按“交易流水号+交易时间+交易金额”去重 {removed} 条。")
 
     # —— 统一：排序、序号、类型标准化、分箱、星期/节假日 —— 向量化加速
     ts = pd.to_datetime(all_txn["交易时间"], errors="coerce")
