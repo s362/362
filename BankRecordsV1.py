@@ -1,15 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-交易流水批量分析工具 GUI   v6-plus (refactor + 线下银行扩展 + 通信联动修复 + 通信统计)
-Author  : 温岭纪委六室 单柳昊   （2025-08-05 修订）
-重构者  : （效率优化版 2025-08-28）
-扩展者  : （线下农行/建行接入 2025-09-09）
-联动者  : （通信联动 2025-10-16，号码→姓名/职务回写通信，再以通信姓名→银行“对方职务”）
-修复者  : （通讯录列识别&号码清洗修复 2025-10-16 增强版）
-统计者  : （新增通信统计-按对方号码 2025-10-20）
-增强者  : （农历节日统计：春节/中秋/端午 + 当天及前5天；删除国庆/情人节；深夜统计；空白不写nan） 2025-10-20
-"""
 
 import sys, os
 import tkinter as tk
@@ -42,6 +32,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 # ------------------------------------------------------------------
 OUT_DIR: Optional[Path] = None
 full_ts_pat = re.compile(r"\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}\.\d+")
+# 紧凑日期时间（无分隔符）匹配：12~16 位（YYYYMMDDHHMMSS / YYYYMMDDHHMM），>14 截前 14
+COMPACT_DT_DIGITS_RE = re.compile(r"^\d{12,16}$")
+ONLY_DIGITS_RE = re.compile(r"\D+")
+
 TEMPLATE_COLS = [
     "序号","查询对象","反馈单位","查询项","查询账户","查询卡号","交易类型","借贷标志","币种",
     "交易金额","账户余额","交易时间","交易流水号","本方账号","本方卡号","交易对方姓名","交易对方账户",
@@ -51,7 +45,7 @@ TEMPLATE_COLS = [
 ]
 
 # ===== 全局映射 =====
-CONTACT_PHONE_TO_NAME_TITLE: Dict[str, Tuple[str, str]] = {}  # 手机号 -> (姓名, 职务)
+CONTACT_PHONE_TO_NAME_TITLE: Dict[str, Tuple[str, str]] = {}  # 手机号 -> (姓名, 职务)（列名版）
 CALLLOG_NAME_TO_TITLE: Dict[str, str] = {}                    # 通信姓名 -> 职务（来源于号码匹配）
 
 # ===== 通信统计参数 =====
@@ -60,7 +54,7 @@ WORK_END_HOUR   = 18
 NIGHT_START = 23
 NIGHT_END   = 5
 
-# 仅统计：春节 / 中秋节 / 端午节
+# 仅统计：春节 / 中秋节 / 端午节 / 七夕节 / 5月20日
 FESTIVAL_NAMES = ["春节", "中秋节", "端午节", "七夕节", "5月20日"]
 
 # ------------------------------------------------------------------
@@ -107,6 +101,29 @@ def _normalize_time(t: str, is_old: bool) -> str:
         t_num = t.replace(":", "")
         t = f"{t_num[:2]}:{t_num[2:4]}:{t_num[4:]}"
     return t
+
+# === 统一“紧凑日期时间”解析（支持 12/14/16 位；>14 截前 14；12 位默认秒=00）===
+def _parse_compact_datetime(s: Any) -> Optional[str]:
+    if s is None:
+        return None
+    raw = safe_str(s).strip()
+    if not raw:
+        return None
+    digits = ONLY_DIGITS_RE.sub("", raw)
+    if not COMPACT_DT_DIGITS_RE.fullmatch(digits):
+        return None
+    # 取前 14 位（YYYYMMDDHHMMSS），12 位（YYYYMMDDHHMM）补秒
+    if len(digits) >= 14:
+        y, m, d = int(digits[0:4]), int(digits[4:6]), int(digits[6:8])
+        hh, mm, ss = int(digits[8:10]), int(digits[10:12]), int(digits[12:14])
+    else:  # 12 位
+        y, m, d = int(digits[0:4]), int(digits[4:6]), int(digits[6:8])
+        hh, mm, ss = int(digits[8:10]), int(digits[10:12]), 0
+    try:
+        dt = datetime.datetime(y, m, d, hh, mm, ss)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 def save_df_auto_width(
     df: pd.DataFrame,
@@ -217,8 +234,6 @@ def _is_festival_day_lunar(g_date: datetime.date) -> str:
       - 七夕：农历 七月 初七
       - 5月20日：公历 5 月 20 日
     返回 '春节' / '中秋节' / '端午节' / '七夕节' / '5月20日' 或 ''。
-    需要 lunardate；若不可用则回退到 chinese_calendar 的近似判定（春节/中秋/端午），
-    但七夕与 5/20 在回退时仍可用公历判断覆盖 5/20。
     """
     # 公历固定日：5/20
     if g_date.month == 5 and g_date.day == 20:
@@ -240,7 +255,7 @@ def _is_festival_day_lunar(g_date: datetime.date) -> str:
         except Exception:
             pass
 
-    # 回退：用 chinese_calendar 的节日枚举名近似（不含春节15天的完整覆盖；七夕无法靠该库识别）
+    # 回退：用 chinese_calendar 的节日枚举名近似
     if get_holiday_detail is not None:
         try:
             is_hol, hol = get_holiday_detail(g_date)
@@ -255,17 +270,9 @@ def _is_festival_day_lunar(g_date: datetime.date) -> str:
         except Exception:
             pass
 
-    # 回退场景下，七夕无法从 chinese_calendar 识别，只能依赖 lunardate。
-    # 但 5/20 已在顶部用公历命中。
     return ""
 
-
 def _festival_name_window(g_date: datetime.date) -> str:
-    """
-    节日窗口：节日当天 + 前5天。
-    若存在 k∈[0..5] 使 g_date + k 是节日当天，则 g_date 计入该节日。
-    多重命中时按优先级：春节 > 中秋节 > 端午节。
-    """
     hits = []
     for k in range(0, 1):
         d2 = g_date + datetime.timedelta(days=k)
@@ -274,9 +281,7 @@ def _festival_name_window(g_date: datetime.date) -> str:
             hits.append((k, nm))
     if not hits:
         return ""
-    # 最近优先 + 节日优先级
     hits.sort(key=lambda x: (x[0], ["春节","中秋节","端午节","七夕节","5月20日"].index(x[1])))
-
     return hits[0][1]
 
 def _festival_series(ts: pd.Series) -> pd.Series:
@@ -358,7 +363,7 @@ def holder_from_folder(folder: Path) -> str:
     return ""
 
 # ------------------------------------------------------------------
-# 解析器（保持原逻辑为主，少量空白处理）
+# 解析器
 # ------------------------------------------------------------------
 @lru_cache(maxsize=None)
 def _header_row(path: Path) -> int:
@@ -368,6 +373,38 @@ def _header_row(path: Path) -> int:
             return i
     return 0
 
+# 统一时间解析：优先紧凑 12/14/16 位；再特定格式；再拼接日期+时间
+def _parse_dt(d, t, is_old):
+    try:
+        s_d = safe_str(d).strip()
+        s_t = safe_str(t).strip()
+
+        # 1) 单列自带紧凑日期时间
+        res = _parse_compact_datetime(s_d)
+        if res: return res
+        res = _parse_compact_datetime(s_t)
+        if res: return res
+
+        # 2) 分列（日期8位 + 时间6位）合成
+        digits_d = ONLY_DIGITS_RE.sub("", s_d)
+        digits_t = ONLY_DIGITS_RE.sub("", s_t)
+        if COMPACT_DT_DIGITS_RE.fullmatch(digits_d) or COMPACT_DT_DIGITS_RE.fullmatch(digits_t):
+            res = _parse_compact_datetime(digits_d) or _parse_compact_datetime(digits_t)
+            if res: return res
+        if len(digits_d) >= 8 and len(digits_t) >= 6:
+            res = _parse_compact_datetime(digits_d[:8] + digits_t[:6])
+            if res: return res
+
+        # 3) 特定格式：YYYY-MM-DD-HH.MM.SS.microsec
+        if isinstance(s_t, str) and full_ts_pat.fullmatch(s_t):
+            dt = pd.to_datetime(s_t, format="%Y-%m-%d-%H.%M.%S.%f", errors="coerce")
+        else:
+            dt = pd.to_datetime(f"{s_d} {_normalize_time(s_t, is_old)}".strip(), errors="coerce")
+
+        return dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(dt) else "wrong"
+    except Exception:
+        return "wrong"
+
 def _read_raw(p: Path) -> pd.DataFrame:
     try:
         return pd.read_excel(p, header=_header_row(p))
@@ -375,18 +412,8 @@ def _read_raw(p: Path) -> pd.DataFrame:
         print("❌", p.name, e)
         return pd.DataFrame()
 
-def _parse_dt(d, t, is_old):
-    try:
-        if isinstance(t, str) and full_ts_pat.fullmatch(t.strip()):
-            dt = pd.to_datetime(t, format="%Y-%m-%d-%H.%M.%S.%f", errors="coerce")
-        else:
-            dt = pd.to_datetime(f"{d} {_normalize_time(safe_str(t), is_old)}".strip(), errors="coerce")
-        return dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(dt) else "wrong"
-    except Exception:
-        return "wrong"
-
 # ------------------------------------------------------------------
-# CSV → 模板（保持原逻辑，空白处理增强）
+# CSV → 模板（时间解析增强）
 # ------------------------------------------------------------------
 def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.DataFrame:
     if raw.empty:
@@ -431,11 +458,19 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
         out["交易金额"] = pd.to_numeric(col(["交易金额","金额","发生额"], 0), errors="coerce")
         out["账户余额"] = pd.to_numeric(col(["交易余额","余额","账户余额"], 0), errors="coerce")
         out["借贷标志"] = col(["收付标志",""], "")
+
+        # 交易时间解析：支持紧凑 12/14/16 位
         if "交易时间" in df.columns:
-            tt = pd.to_datetime(df["交易时间"], errors="coerce")
-            out["交易时间"] = np.where(tt.notna(), tt.dt.strftime("%Y-%m-%d %H:%M:%S"), df["交易时间"].map(safe_str))
+            def _parse_any_time(v: Any) -> str:
+                s = safe_str(v).strip()
+                res = _parse_compact_datetime(s)
+                if res: return res
+                tt = pd.to_datetime(s, errors="coerce")
+                return tt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(tt) else (s or "wrong")
+            out["交易时间"] = df["交易时间"].map(_parse_any_time)
         else:
             out["交易时间"] = _S("wrong")
+
         out["交易类型"] = col(["交易类型","业务种类","交易码"], "")
         out["交易流水号"] = col(["交易流水号","柜员流水号","流水号"], "").map(safe_str)
         out["交易对方姓名"] = col(["对手户名","交易对手名称","对手方名称","对方户名","对方名称","对方姓名","收/付方名称"], " ").map(safe_str)
@@ -461,7 +496,7 @@ def csv_to_template(raw: pd.DataFrame, holder: str, feedback_unit: str) -> pd.Da
         print(f"❌ CSV转模板异常：{e}")
         return pd.DataFrame(columns=TEMPLATE_COLS)
 
-# =============================== 各银行解析（略，保留空白处理） ===============================
+# =============================== 各银行解析 ===============================
 def tl_to_template(raw) -> pd.DataFrame:
     if isinstance(raw, dict):
         frames=[]
@@ -484,7 +519,7 @@ def tl_to_template(raw) -> pd.DataFrame:
     out["借贷标志"] = col_multi(["借贷标志","借贷方向","借贷"], "").map(safe_str)
     debit  = pd.to_numeric(col_multi(["借方发生额","借方发生金额"], 0), errors="coerce")
     credit = pd.to_numeric(col_multi(["贷方发生额","贷方发生金额"], 0), errors="coerce")
-    out["交易金额"] = debit.fillna(0).where(debit.ne(0), credit)
+    out["交易金额"] = credit.where(credit.gt(0), -debit)
     out["账户余额"] = pd.to_numeric(col_multi(["账户余额","余额"], 0), errors="coerce")
     dates = col_multi(["交易日期","原交易日期","会计日期"]).map(safe_str)
     raw_times = col_multi(["交易时间","原交易时间","时间"]).map(safe_str).str.strip()
@@ -552,10 +587,21 @@ def mt_to_template(raw: pd.DataFrame) -> pd.DataFrame:
     out["交易金额"]=credit.where(credit.gt(0), -debit)
     out["账户余额"]=pd.to_numeric(col("余额"), errors="coerce")
     out["借贷标志"]=np.where(credit.gt(0),"进","出")
+
     def _fmt_time(v:str)->str:
-        v=safe_str(v).strip()
-        try: return datetime.datetime.strptime(v,"%Y%m%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
-        except Exception: return v or "wrong"
+        s = safe_str(v).strip()
+        res = _parse_compact_datetime(s)
+        if res: return res
+        try:
+            tt = pd.to_datetime(s, errors="coerce")
+            if pd.notna(tt): return tt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        try:
+            return datetime.datetime.strptime(s,"%Y%m%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return s or "wrong"
+
     out["交易时间"]=col("时间").map(_fmt_time)
     out["交易摘要"]=col("摘要"," ").map(safe_str); out["交易流水号"]=col("柜员流水号").map(safe_str).str.strip()
     out["交易柜员号"]=col("记账柜员 ").map(safe_str).str.strip(); out["交易网点代码"]=col("记账机构").map(safe_str).str.strip()
@@ -583,13 +629,20 @@ def rc_to_template(raw: pd.DataFrame, holder: str, is_old: bool) -> pd.DataFrame
     out["交易摘要"]=col("备注") if is_old else col("摘要","wrong")
     return out.reindex(columns=TEMPLATE_COLS, fill_value="")
 
-# ---- 农行线下 APSH / 建行线下（保持不变，略） ----
+# ---- 农行线下 APSH / 建行线下
 def _is_abc_offline_file(p: Path) -> bool:
     try: xls = pd.ExcelFile(p); return "APSH" in xls.sheet_names
     except Exception: return False
 
 def _merge_abc_datetime(date_val, time_val) -> str:
-    ds = re.sub(r"\D","", "" if date_val is None else safe_str(date_val).strip())
+    s_date = safe_str(date_val).strip()
+    s_time = safe_str(time_val).strip()
+    res = _parse_compact_datetime(s_date)
+    if res: return res
+    res = _parse_compact_datetime(s_time)
+    if res: return res
+
+    ds = re.sub(r"\D","", s_date)
     date_ts = pd.to_datetime(ds[:8], format="%Y%m%d", errors="coerce") if len(ds)>=8 else pd.to_datetime(date_val, errors="coerce")
     if pd.isna(date_ts): return "wrong"
     def to_hhmmss(t)->str:
@@ -608,7 +661,7 @@ def _merge_abc_datetime(date_val, time_val) -> str:
             tt=pd.to_datetime("2000-01-01 "+s.replace(":",":").replace(":",":"), errors="coerce")
             if pd.notna(tt): return tt.strftime("%H%M%S")
         digits=re.sub(r"\D","",s); return (digits.zfill(6)[:6]) if digits!="" else "000000"
-    hhmmss=to_hhmmss(time_val)
+    hhmmss=to_hhmmss(s_time)
     return f"{date_ts.strftime('%Y-%m-%d')} {hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"
 
 def abc_offline_from_file(p: Path) -> pd.DataFrame:
@@ -712,34 +765,20 @@ def ccb_offline_from_file(p: Path) -> pd.DataFrame:
     return out.reindex(columns=TEMPLATE_COLS, fill_value="")
 
 # ------------------------------------------------------------------
-# 通讯录读取（保持上一版修复能力）
+# 通讯录读取（列名版：姓名/职务/号码）
 # ------------------------------------------------------------------
-CONTACT_NAME_COLS = ["姓名","联系人","人员姓名","姓名/名称"]
-CONTACT_DEPT_KEYS = ["实际工作单位"]
-CONTACT_TITLE_KEYS = ["职务","职务或岗位","岗位"]
-CONTACT_PHONE_KEYS = ["号码","手机号","手机号码","联系电话","电话","联系方式","联系号码","移动电话","联系手机","联系电话（手机）","手机"]
+STRICT_CONTACTS_REQUIRED = ["姓名","职务","号码"]
 
-def _guess_header_row(xls: pd.ExcelFile, sheet_name: str, scan_rows: int = 30) -> int:
+def _guess_header_row_strict(xls: pd.ExcelFile, sheet_name: str, scan_rows: int = 30) -> Optional[int]:
     df0 = xls.parse(sheet_name, header=None, nrows=scan_rows)
     for i, row in df0.iterrows():
-        if row.astype(str).str.contains("姓名|号码|联系电话|电话|手机号|职务|岗位|实际工作单位|联系方式").any():
+        vals = [safe_str(v).strip() for v in row.values]
+        if set(STRICT_CONTACTS_REQUIRED).issubset(set(vals)):
             return i
-    return 0
+    return None
 
-def _compose_title(dept: Any, title: Any) -> str:
-    d = safe_str(dept).strip(); t = safe_str(title).strip()
-    if d and t: return f"{d}-{t}"
-    if t: return t
-    if d: return d
-    return ""
-
-def _extract_mobile_from_row(row: pd.Series) -> str:
-    text = " ".join(map(lambda v: safe_str(v), row.values))
-    m = _MOBILE_PAT.search(text)
-    return m.group(1) if m else ""
-
-def load_contacts_phone_map(root: Path) -> Dict[str, Tuple[str,str]]:
-    print("正在读取通讯录......")
+def load_contacts_phone_map_strict(root: Path) -> Dict[str, Tuple[str,str]]:
+    print("正在读取通讯录（列名）......")
     def _is_in_out_dir(p: Path) -> bool:
         try: return OUT_DIR is not None and p.resolve().is_relative_to(OUT_DIR.resolve())
         except AttributeError: return OUT_DIR is not None and str(p.resolve()).startswith(str(OUT_DIR.resolve()))
@@ -748,7 +787,8 @@ def load_contacts_phone_map(root: Path) -> Dict[str, Tuple[str,str]]:
         for bp in builtin_files:
             print(f"  • 使用内置通讯录：{bp.name}")
     repo_files = [p for p in root.rglob("*通讯录*.xls*") if ("已标注" not in p.stem) and (not _is_in_out_dir(p))]
-    all_files: List[Path] = []; seen: set[str] = set()
+    all_files: List[Path] = []
+    seen: set[str] = set()
     for p in [*builtin_files, *repo_files]:
         try: rp = str(p.resolve())
         except Exception: rp = str(p)
@@ -757,63 +797,77 @@ def load_contacts_phone_map(root: Path) -> Dict[str, Tuple[str,str]]:
     if not all_files:
         print("ℹ️ 未发现可用的通讯录。"); return {}
 
-    merged: Dict[str, Tuple[str,str]] = {}; total_rows=0; total_with_phone=0
+    merged: Dict[str, Tuple[str,str]] = {}
     for p in all_files:
         try: xls = pd.ExcelFile(p)
         except Exception as e:
             print("❌ 通讯录载入失败", p.name, e); continue
         for sht in xls.sheet_names:
             try:
-                hdr_row = _guess_header_row(xls, sht, 30)
-                df0 = xls.parse(sht, header=hdr_row); df0.columns = pd.Index(df0.columns).astype(str).str.strip()
-                def _find_col(keys: List[str]) -> Optional[str]:
-                    for c in df0.columns:
-                        cs = str(c).strip()
-                        for k in keys:
-                            if k in cs: return c
-                    return None
-                name_col  = _find_col(CONTACT_NAME_COLS)
-                phone_col = _find_col(CONTACT_PHONE_KEYS)
-                dept_col  = _find_col(CONTACT_DEPT_KEYS)
-                title_col = _find_col(CONTACT_TITLE_KEYS)
-                dtype_kw = {phone_col: str} if phone_col else None
-                df = xls.parse(sht, header=hdr_row, dtype=dtype_kw); df.columns = pd.Index(df.columns).astype(str).str.strip()
-                total_rows += len(df.index)
-                nm_ser   = df[name_col].map(safe_str).str.strip() if name_col else pd.Series([""]*len(df))
-                dept_ser = df[dept_col] if dept_col else pd.Series([""]*len(df))
-                titl_ser = df[title_col] if title_col else pd.Series([""]*len(df))
-                phone_ser = (df[phone_col].map(normalize_phone_cell) if phone_col else df.apply(_extract_mobile_from_row, axis=1))
-                sheet_phones = phone_ser.astype(bool).sum(); total_with_phone += int(sheet_phones)
-                print(f"  • 通讯录 {p.name} / {sht}: 行数 {len(df)}, 命中手机号 {int(sheet_phones)}")
-                for nm, ph, dp, tt in zip(nm_ser, phone_ser, dept_ser, titl_ser):
-                    if not ph: continue
-                    job = _compose_title(dp, tt)
-                    if ph not in merged: merged[ph] = (nm, job)
-                    else:
-                        old_nm, old_job = merged[ph]
-                        merged[ph] = (old_nm or nm, old_job or job)
+                hdr = _guess_header_row_strict(xls, sht, 40)
+                if hdr is None:
+                    print(f"  • 跳过 {p.name}/{sht}：未找到表头（需要：姓名/职务/号码）")
+                    continue
+                df = xls.parse(sht, header=hdr)
+                df.columns = pd.Index(df.columns).astype(str).str.strip()
+                if not set(STRICT_CONTACTS_REQUIRED).issubset(set(df.columns)):
+                    print(f"  • 跳过 {p.name}/{sht}：缺少列 {STRICT_CONTACTS_REQUIRED}")
+                    continue
+                nm = df["姓名"].map(safe_str).str.strip()
+                tt = df["职务"].map(safe_str).str.strip()
+                ph = df["号码"].map(normalize_phone_cell).str.strip()
+                hit = 0
+                for a,b,c in zip(nm, tt, ph):
+                    if not c: continue
+                    merged[c] = (a, b)  # 后者覆盖前者同号码
+                    hit += 1
+                print(f"  • 通讯录 {p.name}/{sht}：载入 {len(df)} 行，命中号码 {hit}")
             except Exception as e:
                 print("❌ 通讯录解析失败", f"{p.name}->{sht}", e)
-    print(f"✅ 通讯录号码映射加载完成：{len(merged)} 条（扫描行数 {total_rows}；含手机号 {total_with_phone}）。")
+    print(f"✅ 通讯录号码映射加载完成：{len(merged)} 条。")
     return merged
 
 # ------------------------------------------------------------------
-# 通信标注 + 统计（含农历节日与深夜）
+# 通信标注（列名版）
+#   仅以“对方号码”列为键，匹配通讯录“号码”→覆盖写入“对方姓名”“对方职务”
 # ------------------------------------------------------------------
-CALLLOG_PHONE_COL_CANDS = ["对方号码"]
-CALLLOG_NAME_COL_CANDS  = ["对方姓名"]
-CALLLOG_DATETIME_COL_CANDS = ["通话时间"]
-CALLLOG_DATE_COL_CANDS = ["日期","发生日期","通话日期"]
-CALLLOG_TIME_COL_CANDS = ["时间","发生时间","通话时间","开始时间","呼叫时间"]
-CALLLOG_DURATION_COL_CANDS = ["通话时长"]
-
-def _find_col_any(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
-    for c in map(str, df.columns):
-        sc = c.strip()
-        for key in cands:
-            if key in sc:
-                return c
+def _find_header_row_exact(xls: pd.ExcelFile, sheet_name: str, required_cols: List[str], scan_rows: int = 40) -> Optional[int]:
+    df0 = xls.parse(sheet_name, header=None, nrows=scan_rows)
+    req = set(required_cols)
+    for i, row in df0.iterrows():
+        vals = [safe_str(v).strip() for v in row.values]
+        if req.issubset(set(vals)):
+            return i
     return None
+
+def _compose_datetime_from_cols_relaxed(df: pd.DataFrame) -> pd.Series:
+    # 单列完整时间优先
+    for c in ["通话时间"]:
+        if c in df.columns:
+            ser_raw = df[c].map(safe_str).str.strip()
+            ser_dt = ser_raw.map(lambda s: _parse_compact_datetime(s) or s)
+            ser = pd.to_datetime(ser_dt, errors="coerce")
+            if ser.notna().any():
+                return ser
+    # 日期 + 时间拼
+    c_date = next((c for c in ["日期","发生日期","通话日期"] if c in df.columns), None)
+    c_time = next((c for c in ["时间","发生时间","通话时间","开始时间","呼叫时间"] if c in df.columns), None)
+    if c_date and c_time:
+        combo = (df[c_date].map(safe_str).str.strip() + " " + df[c_time].map(safe_str).str.strip())
+        ser = pd.to_datetime(combo.map(lambda s: _parse_compact_datetime(s) or s), errors="coerce")
+        return ser
+    if c_date:
+        ser = pd.to_datetime(df[c_date], errors="coerce")
+        return ser
+    return pd.to_datetime(pd.Series([pd.NaT]*len(df), index=df.index), errors="coerce")
+
+def _flag_offwork(ts: pd.Series) -> pd.Series:
+    h = ts.dt.hour
+    return (h < WORK_START_HOUR) | (h >= WORK_END_HOUR)
+
+def _flag_late_night(ts: pd.Series) -> pd.Series:
+    h = ts.dt.hour
+    return (h >= NIGHT_START) | (h < NIGHT_END)
 
 def _parse_duration_to_seconds(x: Any) -> float:
     if x is None: return np.nan
@@ -840,28 +894,44 @@ def _parse_duration_to_seconds(x: Any) -> float:
         return h*3600 + m*60 + sec
     return np.nan
 
-def _compose_datetime_from_cols(df: pd.DataFrame) -> Optional[pd.Series]:
-    c_dt = _find_col_any(df, CALLLOG_DATETIME_COL_CANDS)
-    if c_dt:
-        ser = pd.to_datetime(df[c_dt], errors="coerce")
-        if ser.notna().any():
-            return ser
-    c_date = _find_col_any(df, CALLLOG_DATE_COL_CANDS)
-    c_time = _find_col_any(df, CALLLOG_TIME_COL_CANDS)
-    if c_date and c_time:
-        combo = (df[c_date].map(safe_str).str.strip() + " " + df[c_time].map(safe_str).str.strip())
-        ser = pd.to_datetime(combo, errors="coerce"); return ser
-    if c_date:
-        return pd.to_datetime(df[c_date], errors="coerce")
-    return None
+def _enrich_comm_strict(df: pd.DataFrame, phone_map: Dict[str, Tuple[str,str]]) -> pd.DataFrame:
+    """
+    ：必须存在列【对方号码】。
+    命中 phone_map(号码→姓名/职务) 后，覆盖写入【对方姓名】【对方职务】；
+    未命中保持原值/或空。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d.columns = pd.Index(d.columns).astype(str).str.strip()
+    if "对方号码" not in d.columns:
+        return pd.DataFrame()  # 要求
 
-def _flag_offwork(ts: pd.Series) -> pd.Series:
-    h = ts.dt.hour
-    return (h < WORK_START_HOUR) | (h >= WORK_END_HOUR)
+    # 确保“对方姓名”“对方职务”列存在
+    if "对方姓名" not in d.columns: d["对方姓名"] = ""
+    if "对方职务" not in d.columns: d["对方职务"] = ""
 
-def _flag_late_night(ts: pd.Series) -> pd.Series:
-    h = ts.dt.hour
-    return (h >= NIGHT_START) | (h < NIGHT_END)
+    norm_phone = d["对方号码"].map(normalize_phone_cell)
+    map_name = []
+    map_title = []
+    for ph in norm_phone:
+        nm, tt = phone_map.get(ph, ("",""))
+        map_name.append(nm)
+        map_title.append(tt)
+    map_name = pd.Series(map_name, index=d.index)
+    map_title = pd.Series(map_title, index=d.index)
+
+    # 命中则覆盖到【对方姓名】【对方职务】
+    d["对方姓名"] = np.where(map_name != "", map_name, d["对方姓名"].map(safe_str))
+    d["对方职务"] = np.where(map_title != "", map_title, d["对方职务"].map(safe_str))
+
+    # —— 下方仅用于统计标签（不影响号码→姓名/职务匹配）
+    ts = _compose_datetime_from_cols_relaxed(d)
+    d["__ts__"] = ts
+    d["节日"] = _festival_series(ts)
+    d["是否深夜(23–5)"] = _flag_late_night(ts).map({True:"是", False:""})
+
+    return d
 
 def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     if enriched_df is None or enriched_df.empty:
@@ -869,27 +939,31 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     d = enriched_df.copy()
     d.columns = pd.Index(d.columns).astype(str).str.strip()
 
-    phone_col = _find_col_any(d, CALLLOG_PHONE_COL_CANDS)
+    phone_col = "对方号码" if "对方号码" in d.columns else None
     if not phone_col:
         return pd.DataFrame()
 
     d["__对方号码__"] = d[phone_col].map(normalize_phone_cell)
 
-    name_col_existing = _find_col_any(d, CALLLOG_NAME_COL_CANDS)
-    if "姓名" in d.columns:
+    # 兼容列名：优先使用对方姓名/对方职务
+    if "对方姓名" in d.columns:
+        nm = d["对方姓名"].map(safe_str)
+    elif "姓名" in d.columns:
         nm = d["姓名"].map(safe_str)
-    elif name_col_existing:
-        nm = d[name_col_existing].map(safe_str)
     else:
         nm = pd.Series([""]*len(d), index=d.index)
-    title = d["职务"].map(safe_str) if "职务" in d.columns else pd.Series([""]*len(d), index=d.index)
 
-    ts = _compose_datetime_from_cols(d)
-    if ts is None:
-        ts = pd.to_datetime(pd.Series([pd.NaT]*len(d), index=d.index), errors="coerce")
+    if "对方职务" in d.columns:
+        title = d["对方职务"].map(safe_str)
+    elif "职务" in d.columns:
+        title = d["职务"].map(safe_str)
+    else:
+        title = pd.Series([""]*len(d), index=d.index)
+
+    ts = d["__ts__"] if "__ts__" in d.columns else _compose_datetime_from_cols_relaxed(d)
     d["__ts__"] = ts
 
-    dur_col = _find_col_any(d, CALLLOG_DURATION_COL_CANDS)
+    dur_col = next((c for c in ["通话时长","时长"] if c in d.columns), None)
     if dur_col:
         dur_sec = d[dur_col].apply(_parse_duration_to_seconds)
     else:
@@ -900,7 +974,6 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     late_flag    = _flag_late_night(d["__ts__"])
     ge3min_flag  = d["__dur_sec__"] >= 180
 
-    # 节日窗口名称（春节/中秋节/端午节）
     fest_ser = _festival_series(d["__ts__"])
 
     def _mode_nonempty(series: pd.Series) -> str:
@@ -911,7 +984,6 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
 
     grp = d.groupby("__对方号码__", dropna=False)
 
-    # 三大节日计数
     fest_counts = {f: grp.apply(lambda g, fname=f: int((fest_ser.loc[g.index] == fname).sum())) for f in FESTIVAL_NAMES}
 
     out = pd.DataFrame({
@@ -929,46 +1001,15 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["通信次数","通话≥3分钟次数"], ascending=[False,False], kind="mergesort").reset_index(drop=True)
     return out
 
-def _enrich_one_comm_df(df: pd.DataFrame, phone_to_name_title: Dict[str, Tuple[str,str]]) -> Tuple[pd.DataFrame, Dict[str,str]]:
-    if df is None or df.empty: return pd.DataFrame(), {}
-    d = df.copy(); d.columns = pd.Index(d.columns).astype(str).str.strip()
-    phone_col = _find_col_any(d, CALLLOG_PHONE_COL_CANDS)
-    if not phone_col:
-        return d, {}
-    phones = d[phone_col].map(normalize_phone_cell)
-
-    names = []; titles = []
-    for ph in phones:
-        nm, job = phone_to_name_title.get(ph, ("",""))
-        names.append(nm); titles.append(job)
-    names  = pd.Series(names, index=d.index)
-    titles = pd.Series(titles, index=d.index)
-
-    name_col_existing = _find_col_any(d, CALLLOG_NAME_COL_CANDS)
-    if name_col_existing:
-        d["姓名"] = np.where(names!="", names, d[name_col_existing].map(safe_str).str.strip())
-    else:
-        d["姓名"] = names
-    d["职务"] = titles
-
-    ts = _compose_datetime_from_cols(d)
-    if ts is None:
-        ts = pd.to_datetime(pd.Series([pd.NaT]*len(d), index=d.index), errors="coerce")
-    d["__ts__"] = ts
-    d["节日"] = _festival_series(ts)         # "春节"/"中秋节"/"端午节"/""
-    d["是否深夜(23–5)"] = _flag_late_night(ts).map({True:"是", False:""})
-
-    tmp = d[["姓名","职务"]].copy()
-    tmp = tmp[(tmp["姓名"]!="") & (~tmp["姓名"].map(lambda x: safe_str(x).lower()=="nan")) & (tmp["职务"]!="")]
-    map_name_title: Dict[str,str] = {}
-    for name, sub in tmp.groupby("姓名"):
-        uniq = list(dict.fromkeys(sub["职务"].map(safe_str).tolist()))
-        map_name_title[name] = "、".join(x for x in uniq if x)
-    return d, map_name_title
-
-def load_and_enrich_communications(root: Path, phone_to_name_title: Dict[str, Tuple[str,str]]) -> Dict[str,str]:
+def load_and_enrich_communications_strict(root: Path, phone_to_name_title: Dict[str, Tuple[str,str]]) -> Dict[str,str]:
+    """
+    遍历所有文件名包含“通信”的 .xlsx；
+    每个 sheet 必须包含表头：至少“对方号码”（可选“对方姓名”“对方职务”）；
+    命中通讯录（号码）→ 覆盖写入对方姓名、对方职务；
+    返回：姓名 -> 职务 映射，用于后续资金对手职务标注。
+    """
     if not phone_to_name_title:
-        print("ℹ️ 未能从通讯录生成号码映射，跳过通信标注。")
+        print("ℹ️ 未能从通讯录生成号码映射，跳过通信标注（版）。")
         return {}
 
     def _is_in_out_dir(p: Path) -> bool:
@@ -989,30 +1030,37 @@ def load_and_enrich_communications(root: Path, phone_to_name_title: Dict[str, Tu
             xls = pd.ExcelFile(p)
         except Exception as e:
             print("❌ 通信文件载入失败", p.name, e); continue
+
         frames = []; name_map_file: Dict[str,str] = {}
         for sht in xls.sheet_names:
             try:
-                df0 = xls.parse(sheet_name=sht, header=0)
+                hdr = _find_header_row_exact(xls, sht, ["对方号码"], 50)
+                if hdr is None:
+                    print(f"  • 跳过 {p.name}/{sht}：未找到表头（至少需要‘对方号码’）")
+                    continue
+                df0 = xls.parse(sheet_name=sht, header=hdr)
+                df0.columns = pd.Index(df0.columns).astype(str).str.strip()
             except Exception as e:
                 print("❌ 通信解析失败", f"{p.name}->{sht}", e); continue
-            enriched, name_map = _enrich_one_comm_df(df0, phone_to_name_title)
+
+            enriched = _enrich_comm_strict(df0, phone_to_name_title)
             if not enriched.empty:
                 if "__来源sheet__" not in enriched.columns:
                     enriched.insert(0,"__来源sheet__",sht)
                 frames.append(enriched.drop(columns=[], errors="ignore"))
-            for k,v in name_map.items():
-                if k in name_map_file and name_map_file[k]:
-                    exist = name_map_file[k].split("、")
-                    add = [x for x in v.split("、") if x not in exist]
-                    name_map_file[k] = "•".join(exist + add).replace("•","、")
-                else:
-                    name_map_file[k] = v
+
+                # 生成：姓名 -> 职务 映射（依据 对方姓名/对方职务）
+                tmp = enriched[["对方姓名","对方职务"]].copy()
+                tmp = tmp[(tmp["对方姓名"]!="") & (~tmp["对方姓名"].map(lambda x: safe_str(x).lower()=="nan")) & (tmp["对方职务"]!="")]
+                for nm, sub in tmp.groupby("对方姓名"):
+                    uniq = list(dict.fromkeys(sub["对方职务"].map(safe_str).tolist()))
+                    name_map_file[nm] = "、".join(x for x in uniq if x)
 
         if frames:
             merged = pd.concat(frames, ignore_index=True)
             merged = merged.drop(columns=["__ts__"], errors="ignore")
             save_df_auto_width(merged, Path("通信-已标注")/f"{p.stem}-已标注", index=False, engine="openpyxl")
-            print(f"✅ 通信已标注导出：{p.stem}-已标注.xlsx")
+            print(f"✅ 通信已标注导出（）：{p.stem}-已标注.xlsx")
             all_enriched_frames.append(merged)
 
             stat_df = _stats_by_phone(merged)
@@ -1022,6 +1070,7 @@ def load_and_enrich_communications(root: Path, phone_to_name_title: Dict[str, Tu
             else:
                 print("ℹ️ 未生成该文件的通信统计（可能缺少号码/时间列）")
 
+        # 合并姓名->职务映射
         for k,v in name_map_file.items():
             if k in out_all and out_all[k]:
                 exist = out_all[k].split("、")
@@ -1037,19 +1086,20 @@ def load_and_enrich_communications(root: Path, phone_to_name_title: Dict[str, Tu
             save_df_auto_width(stat_all, Path("通信-统计")/"ALL-通信统计-按号码", index=False, engine="openpyxl")
             print("✅ 通信统计汇总导出：ALL-通信统计-按号码.xlsx")
 
-    print(f"✅ 通信姓名映射生成 {len(out_all)} 条。")
+    print(f"✅ 通信姓名映射（）生成 {len(out_all)} 条。")
     return out_all
 
 # ------------------------------------------------------------------
-# 合并全部流水（与上一版一致，略）
+# 合并全部流水（仅处理一次）
 # ------------------------------------------------------------------
 def merge_all_txn(root_dir: str) -> pd.DataFrame:
     root = Path(root_dir).expanduser().resolve()
 
     global CONTACT_PHONE_TO_NAME_TITLE, CALLLOG_NAME_TO_TITLE
-    CONTACT_PHONE_TO_NAME_TITLE = load_contacts_phone_map(root)
-    CALLLOG_NAME_TO_TITLE = load_and_enrich_communications(root, CONTACT_PHONE_TO_NAME_TITLE)
+    CONTACT_PHONE_TO_NAME_TITLE = load_contacts_phone_map_strict(root)
+    CALLLOG_NAME_TO_TITLE = load_and_enrich_communications_strict(root, CONTACT_PHONE_TO_NAME_TITLE)
 
+    # 各类候选文件
     china_files = [p for p in root.rglob("*-*-交易流水.xls*")]
     all_excel = list(root.rglob("*.xls*"))
     rc_candidates = [p for p in all_excel if "农商行" in p.as_posix()]
@@ -1065,17 +1115,46 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     print(f"✅ 网上银行 {len(china_files)}，老农商 {len(old_rc)}，新农商 {len(new_rc)}，泰隆 {len(tl_files)}，民泰 {len(mt_files)}，农行线下 {len(abc_offline_files)}，建行线下 {len(ccb_offline_files)}，CSV {len(csv_txn_files)}；通信映射 {len(CALLLOG_NAME_TO_TITLE)} 条。")
 
     dfs: List[pd.DataFrame] = []
+    processed_files: set[Path] = set()   # 防重复处理
 
+    def _append_and_mark(df: pd.DataFrame, p: Path):
+        if not df.empty:
+            dfs.append(df)
+            processed_files.add(p)
+
+    # 1) 先处理网上银行“*-*-交易流水.xls*”
     for p in china_files:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         try:
-            df = pd.read_excel(p, dtype={"查询卡号":str,"查询账户":str,"交易对方证件号码":str,"本方账号":str,"本方卡号":str})
+            df = pd.read_excel(
+                p,
+                dtype={"查询卡号":str,"查询账户":str,"交易对方证件号码":str,"本方账号":str,"本方卡号":str}
+            )
+            # —— 统一规范“交易时间”（支持 12/14/15/16 位紧凑时间）
+            if "交易时间" in df.columns:
+                def _fmt_any_time(v: Any) -> str:
+                    s = safe_str(v).strip()
+                    res = _parse_compact_datetime(s)
+                    if res: return res
+                    tt = pd.to_datetime(s, errors="coerce")
+                    return tt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(tt) else (s or "wrong")
+                df["交易时间"] = df["交易时间"].map(_fmt_any_time)
+            elif "交易日期" in df.columns and "交易时间" in df.columns:
+                df["交易时间"] = [
+                    _parse_dt(d, t, False) for d, t in zip(df["交易日期"], df["交易时间"])
+                ]
+
             df["来源文件"] = p.name
-            dfs.append(df)
+            _append_and_mark(df, p)
         except Exception as e:
             print("❌", p.name, e)
 
+    # 2) 老/新 农商行（跳过已处理 & 特殊抬头）
     for p in old_rc + new_rc:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         kw = should_skip_special(p)
         if kw:
@@ -1085,10 +1164,15 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         is_old = p in old_rc
         df = rc_to_template(raw, holder, is_old)
         if not df.empty:
-            df["来源文件"] = p.name; dfs.append(df)
+            df["来源文件"] = p.name
+            _append_and_mark(df, p)
 
+    # 3) 泰隆（未处理过才处理）
     for p in tl_files:
-        if "开户" in p.stem: continue
+        if p in processed_files:
+            continue
+        if "开户" in p.stem:
+            continue
         print(f"正在处理 {p.name} ...")
         try: xls = pd.ExcelFile(p)
         except Exception as e:
@@ -1104,33 +1188,49 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
                 print("❌", f"{p.name}->{sht}", e)
         df = tl_to_template(xls_dict)
         if not df.empty:
-            df["来源文件"]=p.name; dfs.append(df)
+            df["来源文件"]=p.name
+            _append_and_mark(df, p)
 
+    # 4) 民泰
     for p in mt_files:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         raw = _read_raw(p); df = mt_to_template(raw)
         if not df.empty:
-            df["来源文件"]=p.name; dfs.append(df)
+            df["来源文件"]=p.name
+            _append_and_mark(df, p)
 
+    # 5) 农行线下
     for p in abc_offline_files:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         try:
             df=abc_offline_from_file(p)
             if not df.empty:
-                df["来源文件"]=p.name; dfs.append(df)
+                df["来源文件"]=p.name
+                _append_and_mark(df, p)
         except Exception as e:
             print("❌ 农行线下解析失败", p.name, e)
 
+    # 6) 建行线下
     for p in ccb_offline_files:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         try:
             df=ccb_offline_from_file(p)
             if not df.empty:
-                df["来源文件"]=p.name; dfs.append(df)
+                df["来源文件"]=p.name
+                _append_and_mark(df, p)
         except Exception as e:
             print("❌ 建行线下解析失败", p.name, e)
 
+    # 7) CSV
     for p in csv_txn_files:
+        if p in processed_files:
+            continue
         print(f"正在处理 {p.name} ...")
         try:
             raw_csv = _read_csv_smart(p)
@@ -1143,7 +1243,8 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         except Exception as e:
             print("❌ CSV转模板失败", p.name, e); continue
         if not df.empty:
-            df["来源文件"]=p.name; dfs.append(df)
+            df["来源文件"]=p.name
+            _append_and_mark(df, p)
 
     print("文件读取完成，正在整合……")
     if not dfs:
@@ -1181,7 +1282,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         mapd={d:_day_status(d) for d in unique_dates}; status.loc[mask]=dates.loc[mask].map(mapd)
     status.loc[~mask]="wrong"; all_txn["节假日"]=status
 
-    # —— 对方职务（通信优先 + 通讯录回退）
+    # —— 对方职务（通信映射优先）
     final_title_by_name: Dict[str, str] = CALLLOG_NAME_TO_TITLE or {}
     all_txn["对方职务"] = all_txn["交易对方姓名"].map(final_title_by_name).fillna("")
 
@@ -1197,7 +1298,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     return all_txn
 
 # ------------------------------------------------------------------
-# 分析（保持原逻辑）
+# 分析
 # ------------------------------------------------------------------
 def analysis_txn(df: pd.DataFrame) -> None:
     if df.empty: return
@@ -1305,8 +1406,8 @@ def create_gui():
     root.columnconfigure(1, weight=1); root.rowconfigure(4, weight=1)
 
     tip = (
-        "tips1：若要新增通讯录，请在工作目录下放置文件名中包含“通讯录.xlsx”的文件，并至少包含：姓名、实际工作单位、号码。\n"
-        "tips2：通话记录需在工作目录下放置文件名中包含“通信.xlsx”的文件。"
+        "tips1：若要新增通讯录，请在工作目录下放置文件名中包含“通讯录.xlsx”的文件，且表头需包含：姓名、职务、号码。\n"
+        "tips2：通话记录需在工作目录下放置文件名中包含“通信.xlsx”的文件，且表头包含：对方号码（可选：对方姓名、对方职务）。"
     )
     log_box.config(state="normal"); log_box.insert("end", tip + "\n"); log_box.config(state="disabled")
 
@@ -1324,7 +1425,6 @@ def create_gui():
         _orig_print = builtins.print
         builtins.print = lambda *a, **k: log(" ".join(map(str, a)))
         try:
-            # 提示农历精度
             if LunarDate is None:
                 print("⚠️ 未检测到 lunardate 库，农历节日判定将使用近似法（建议：pip install lunardate）")
             all_txn = merge_all_txn(path)
