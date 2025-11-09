@@ -212,6 +212,56 @@ def normalize_phone_cell(x: Any) -> str:
         if m3: return m3.group(1)
     return only_digits
 
+# —— 新增：向量化手机号清洗（性能优化用） ——
+def normalize_phone_series(s: pd.Series) -> pd.Series:
+    """
+    向量化手机号清洗，尽量复刻 normalize_phone_cell 的兼容逻辑：
+    - 识别 +86/86 前缀
+    - 处理 '.0' 与科学计数
+    - 未命中手机号时仅保留数字
+    """
+    if s is None or len(s) == 0:
+        return pd.Series([], dtype=object)
+
+    ss = s.astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+
+    # 处理纯数字/带 .0/科学计数法
+    sci_like = ss.str.fullmatch(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
+    if sci_like.any():
+        def _sci_fix(x: str) -> str:
+            try:
+                if re.fullmatch(r"\d+\.0+", x):
+                    return x.split(".")[0]
+                if re.fullmatch(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?", x):
+                    return str(int(float(x)))
+            except Exception:
+                pass
+            return x
+        ss.loc[sci_like] = ss.loc[sci_like].map(_sci_fix)
+
+    pat = re.compile(r"(?:\+?86[-\s]?)?(1[3-9]\d{9})")
+    extracted = ss.str.extract(pat, expand=False)
+
+    # 回退：仅保留数字
+    fallback_mask = extracted.isna()
+    if fallback_mask.any():
+        only_digits = ss.loc[fallback_mask].str.replace(r"\D", "", regex=True)
+        extracted.loc[fallback_mask] = only_digits
+
+    # 再做一次“长度>=11 且能匹配手机号则取匹配”的兜底
+    long_mask = extracted.str.len().fillna(0) >= 11
+    if long_mask.any():
+        def _strip_to_mobile(x: str) -> str:
+            if not x:
+                return ""
+            m = pat.search(x)
+            if m:
+                return m.group(1)
+            return x
+        extracted.loc[long_mask] = extracted.loc[long_mask].map(_strip_to_mobile)
+
+    return extracted.fillna("")
+
 def str_to_weekday(date_val) -> str:
     dt = pd.to_datetime(date_val, errors="coerce")
     return "wrong" if pd.isna(dt) else ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"][dt.weekday()]
@@ -777,6 +827,7 @@ def _guess_header_row_strict(xls: pd.ExcelFile, sheet_name: str, scan_rows: int 
             return i
     return None
 
+# —— 优化版：向量化读取与去重（保留最后一条，实现“后者覆盖前者”） ——
 def load_contacts_phone_map_strict(root: Path) -> Dict[str, Tuple[str,str]]:
     print("正在读取通讯录（列名）......")
     def _is_in_out_dir(p: Path) -> bool:
@@ -798,6 +849,7 @@ def load_contacts_phone_map_strict(root: Path) -> Dict[str, Tuple[str,str]]:
         print("ℹ️ 未发现可用的通讯录。"); return {}
 
     merged: Dict[str, Tuple[str,str]] = {}
+
     for p in all_files:
         try: xls = pd.ExcelFile(p)
         except Exception as e:
@@ -813,19 +865,25 @@ def load_contacts_phone_map_strict(root: Path) -> Dict[str, Tuple[str,str]]:
                 if not set(STRICT_CONTACTS_REQUIRED).issubset(set(df.columns)):
                     print(f"  • 跳过 {p.name}/{sht}：缺少列 {STRICT_CONTACTS_REQUIRED}")
                     continue
-                nm = df["姓名"].map(safe_str).str.strip()
-                tt = df["职务"].map(safe_str).str.strip()
-                ph = df["号码"].map(normalize_phone_cell).str.strip()
-                hit = 0
-                for a,b,c in zip(nm, tt, ph):
-                    if not c: continue
-                    merged[c] = (a, b)  # 后者覆盖前者同号码
-                    hit += 1
-                print(f"  • 通讯录 {p.name}/{sht}：载入 {len(df)} 行，命中号码 {hit}")
+
+                nm = df["姓名"].astype(str).str.strip()
+                tt = df["职务"].astype(str).str.strip()
+                ph = normalize_phone_series(df["号码"]).str.strip()
+
+                dtmp = pd.DataFrame({"号码": ph, "姓名": nm, "职务": tt})
+                dtmp = dtmp[dtmp["号码"] != ""]
+
+                before = len(dtmp)
+                dtmp = dtmp.drop_duplicates(subset=["号码"], keep="last")
+                hit = len(dtmp)
+                print(f"  • 通讯录 {p.name}/{sht}：载入 {len(df)} 行，命中号码 {hit}（去重前 {before}）")
+
+                if hit:
+                    merged.update(dtmp.set_index("号码")[["姓名","职务"]].to_dict("index"))
             except Exception as e:
                 print("❌ 通讯录解析失败", f"{p.name}->{sht}", e)
     print(f"✅ 通讯录号码映射加载完成：{len(merged)} 条。")
-    return merged
+    return {k: (v["姓名"], v["职务"]) for k, v in merged.items()}
 
 # ------------------------------------------------------------------
 # 通信标注（列名版）
@@ -894,11 +952,13 @@ def _parse_duration_to_seconds(x: Any) -> float:
         return h*3600 + m*60 + sec
     return np.nan
 
+# —— 优化版：向量化匹配覆盖 + 统计标签保留 ——
 def _enrich_comm_strict(df: pd.DataFrame, phone_map: Dict[str, Tuple[str,str]]) -> pd.DataFrame:
     """
     ：必须存在列【对方号码】。
     命中 phone_map(号码→姓名/职务) 后，覆盖写入【对方姓名】【对方职务】；
     未命中保持原值/或空。
+    （向量化实现）
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -911,28 +971,35 @@ def _enrich_comm_strict(df: pd.DataFrame, phone_map: Dict[str, Tuple[str,str]]) 
     if "对方姓名" not in d.columns: d["对方姓名"] = ""
     if "对方职务" not in d.columns: d["对方职务"] = ""
 
-    norm_phone = d["对方号码"].map(normalize_phone_cell)
-    map_name = []
-    map_title = []
-    for ph in norm_phone:
-        nm, tt = phone_map.get(ph, ("",""))
-        map_name.append(nm)
-        map_title.append(tt)
-    map_name = pd.Series(map_name, index=d.index)
-    map_title = pd.Series(map_title, index=d.index)
+    # —— 唯一号码一次清洗 → 映射回全列
+    raw_phone = d["对方号码"]
+    uniq = pd.unique(raw_phone)
+    norm_map = {val: normalize_phone_cell(val) for val in uniq}
+    norm_phone = raw_phone.map(norm_map)
+
+    # —— 将 phone_map 拆成两个 dict，避免 tuple 拆包与 lambda
+    name_dict  = {k: v[0] for k, v in phone_map.items()}
+    title_dict = {k: v[1] for k, v in phone_map.items()}
 
     # 命中则覆盖到【对方姓名】【对方职务】
-    d["对方姓名"] = np.where(map_name != "", map_name, d["对方姓名"].map(safe_str))
-    d["对方职务"] = np.where(map_title != "", map_title, d["对方职务"].map(safe_str))
+    mapped_name  = norm_phone.map(name_dict).fillna("")
+    mapped_title = norm_phone.map(title_dict).fillna("")
+    d["对方姓名"]  = np.where(mapped_name != "",  mapped_name,  d["对方姓名"].map(safe_str))
+    d["对方职务"] = np.where(mapped_title != "", mapped_title, d["对方职务"].map(safe_str))
 
     # —— 下方仅用于统计标签（不影响号码→姓名/职务匹配）
     ts = _compose_datetime_from_cols_relaxed(d)
     d["__ts__"] = ts
-    d["节日"] = _festival_series(ts)
-    d["是否深夜(23–5)"] = _flag_late_night(ts).map({True:"是", False:""})
+    if ts.notna().any():
+        d["节日"] = _festival_series(ts)
+        d["是否深夜(23–5)"] = _flag_late_night(ts).map({True:"是", False:""})
+    else:
+        d["节日"] = ""
+        d["是否深夜(23–5)"] = ""
 
     return d
 
+# —— 优化版：统计向量化，避免重复清洗与重复 groupby.apply ——
 def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     if enriched_df is None or enriched_df.empty:
         return pd.DataFrame()
@@ -943,7 +1010,13 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
     if not phone_col:
         return pd.DataFrame()
 
-    d["__对方号码__"] = d[phone_col].map(normalize_phone_cell)
+    if "__对方号码__" in d.columns:
+        norm_phone = d["__对方号码__"]
+    else:
+        uniq = pd.unique(d[phone_col])
+        norm_map = {val: normalize_phone_cell(val) for val in uniq}
+        norm_phone = d[phone_col].map(norm_map)
+        d["__对方号码__"] = norm_phone
 
     # 兼容列名：优先使用对方姓名/对方职务
     if "对方姓名" in d.columns:
@@ -965,16 +1038,23 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
 
     dur_col = next((c for c in ["通话时长","时长"] if c in d.columns), None)
     if dur_col:
-        dur_sec = d[dur_col].apply(_parse_duration_to_seconds)
+        dur = d[dur_col].astype(str).str.strip()
+        fast_num = dur.str.fullmatch(r"\d+(\.\d+)?([eE][+-]?\d+)?")
+        dur_sec = pd.Series(np.nan, index=d.index, dtype=float)
+        if fast_num.any():
+            dur_sec.loc[fast_num] = dur.loc[fast_num].astype(float).values
+        left = ~fast_num
+        if left.any():
+            dur_sec.loc[left] = dur.loc[left].apply(_parse_duration_to_seconds)
     else:
         dur_sec = pd.Series([np.nan]*len(d), index=d.index)
+
     d["__dur_sec__"] = pd.to_numeric(dur_sec, errors="coerce")
 
-    offwork_flag = _flag_offwork(d["__ts__"])
-    late_flag    = _flag_late_night(d["__ts__"])
+    offwork_flag = _flag_offwork(ts)
+    late_flag    = _flag_late_night(ts)
     ge3min_flag  = d["__dur_sec__"] >= 180
-
-    fest_ser = _festival_series(d["__ts__"])
+    fest_ser     = _festival_series(ts)
 
     def _mode_nonempty(series: pd.Series) -> str:
         s = series.fillna("").map(safe_str).str.strip()
@@ -984,7 +1064,11 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
 
     grp = d.groupby("__对方号码__", dropna=False)
 
-    fest_counts = {f: grp.apply(lambda g, fname=f: int((fest_ser.loc[g.index] == fname).sum())) for f in FESTIVAL_NAMES}
+    # 节日次数一次性计算
+    fest_counts = grp.apply(lambda g: pd.Series({
+        f"{fname}通信次数": int((fest_ser.loc[g.index] == fname).sum())
+        for fname in FESTIVAL_NAMES
+    }))
 
     out = pd.DataFrame({
         "对方号码": grp.size().index,
@@ -994,9 +1078,13 @@ def _stats_by_phone(enriched_df: pd.DataFrame) -> pd.DataFrame:
         "通话≥3分钟次数": grp.apply(lambda g: int(ge3min_flag.loc[g.index].sum())).values,
         "姓名": grp.apply(lambda g: _mode_nonempty(nm.loc[g.index])).values,
         "职务": grp.apply(lambda g: _mode_nonempty(title.loc[g.index])).values,
-    })
+    }).set_index("对方号码", drop=False)
+
+    out = out.join(fest_counts, how="left").fillna(0)
     for fname in FESTIVAL_NAMES:
-        out[f"{fname}通信次数"] = list(fest_counts[fname].values)
+        coln = f"{fname}通信次数"
+        if coln in out.columns:
+            out[coln] = out[coln].astype(int)
 
     out = out.sort_values(["通信次数","通话≥3分钟次数"], ascending=[False,False], kind="mergesort").reset_index(drop=True)
     return out
@@ -1060,7 +1148,7 @@ def load_and_enrich_communications_strict(root: Path, phone_to_name_title: Dict[
             merged = pd.concat(frames, ignore_index=True)
             merged = merged.drop(columns=["__ts__"], errors="ignore")
             save_df_auto_width(merged, Path("通信-已标注")/f"{p.stem}-已标注", index=False, engine="openpyxl")
-            print(f"✅ 通信已标注导出（）：{p.stem}-已标注.xlsx")
+            print(f"✅ 通信标注对手职务导出：{p.stem}-已标注.xlsx")
             all_enriched_frames.append(merged)
 
             stat_df = _stats_by_phone(merged)
@@ -1256,7 +1344,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     before=len(all_txn)
     all_txn = all_txn.drop_duplicates(subset=["交易流水号","交易时间","交易金额"], keep="first").reset_index(drop=True)
     removed=before-len(all_txn)
-    if removed: print(f"🧹 去重 {removed} 条。")
+    if removed: print(f"🧹 去重 {removed} 条.")
 
     ts = pd.to_datetime(all_txn["交易时间"], errors="coerce")
     all_txn.insert(0,"__ts__",ts)
