@@ -1177,15 +1177,34 @@ def load_and_enrich_communications_strict(root: Path, phone_to_name_title: Dict[
     print(f"✅ 通信姓名映射（）生成 {len(out_all)} 条。")
     return out_all
 
-# ------------------------------------------------------------------
-# 合并全部流水（仅处理一次）
-# ------------------------------------------------------------------
 def merge_all_txn(root_dir: str) -> pd.DataFrame:
     root = Path(root_dir).expanduser().resolve()
 
     global CONTACT_PHONE_TO_NAME_TITLE, CALLLOG_NAME_TO_TITLE
-    CONTACT_PHONE_TO_NAME_TITLE = load_contacts_phone_map_strict(root)
-    CALLLOG_NAME_TO_TITLE = load_and_enrich_communications_strict(root, CONTACT_PHONE_TO_NAME_TITLE)
+
+    # 先判断有没有“通信”文件，如果没有则完全不读取通讯录
+    def _is_in_out_dir(p: Path) -> bool:
+        try:
+            return OUT_DIR is not None and p.resolve().is_relative_to(OUT_DIR.resolve())
+        except AttributeError:
+            # 兼容老版本 Python 没有 is_relative_to 的情况
+            return OUT_DIR is not None and str(p.resolve()).startswith(str(OUT_DIR.resolve()))
+
+    comm_files = [
+        p for p in root.rglob("*.xlsx")
+        if ("通信" in p.stem or "通信" in p.name)
+        and ("已标注" not in p.stem)
+        and (not _is_in_out_dir(p))
+    ]
+
+    if comm_files:
+        print(f"📁 检测到 {len(comm_files)} 个包含“通信”的 .xlsx 文件，将加载通讯录并进行通信标注。")
+        CONTACT_PHONE_TO_NAME_TITLE = load_contacts_phone_map_strict(root)
+        CALLLOG_NAME_TO_TITLE = load_and_enrich_communications_strict(root, CONTACT_PHONE_TO_NAME_TITLE)
+    else:
+        CONTACT_PHONE_TO_NAME_TITLE = {}
+        CALLLOG_NAME_TO_TITLE = {}
+        print("ℹ️ 未发现包含“通信”的 .xlsx 文件，本次不读取通讯录，也不做通信标注。")
 
     # 各类候选文件
     china_files = [p for p in root.rglob("*-*-交易流水.xls*")]
@@ -1200,7 +1219,11 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     ccb_offline_files = [p for p in all_excel if _is_ccb_offline_file(p)]
     csv_txn_files = [p for p in root.rglob("交易明细信息.csv")]
 
-    print(f"✅ 网上银行 {len(china_files)}，老农商 {len(old_rc)}，新农商 {len(new_rc)}，泰隆 {len(tl_files)}，民泰 {len(mt_files)}，农行线下 {len(abc_offline_files)}，建行线下 {len(ccb_offline_files)}，CSV {len(csv_txn_files)}；通信映射 {len(CALLLOG_NAME_TO_TITLE)} 条。")
+    print(
+        f"✅ 网上银行 {len(china_files)}，老农商 {len(old_rc)}，新农商 {len(new_rc)}，"
+        f"泰隆 {len(tl_files)}，民泰 {len(mt_files)}，农行线下 {len(abc_offline_files)}，"
+        f"建行线下 {len(ccb_offline_files)}，CSV {len(csv_txn_files)}；通信映射 {len(CALLLOG_NAME_TO_TITLE)} 条。"
+    )
 
     dfs: List[pd.DataFrame] = []
     processed_files: set[Path] = set()   # 防重复处理
@@ -1210,7 +1233,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             dfs.append(df)
             processed_files.add(p)
 
-    # 1) 先处理网上银行“*-*-交易流水.xls*”
+    # 1) 网上银行“*-*-交易流水.xls*”
     for p in china_files:
         if p in processed_files:
             continue
@@ -1218,14 +1241,21 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         try:
             df = pd.read_excel(
                 p,
-                dtype={"查询卡号":str,"查询账户":str,"交易对方证件号码":str,"本方账号":str,"本方卡号":str}
+                dtype={
+                    "查询卡号": str,
+                    "查询账户": str,
+                    "交易对方证件号码": str,
+                    "本方账号": str,
+                    "本方卡号": str,
+                },
             )
-            # —— 统一规范“交易时间”（支持 12/14/15/16 位紧凑时间）
+            # 统一规范“交易时间”（支持紧凑日期时间）
             if "交易时间" in df.columns:
                 def _fmt_any_time(v: Any) -> str:
                     s = safe_str(v).strip()
                     res = _parse_compact_datetime(s)
-                    if res: return res
+                    if res:
+                        return res
                     tt = pd.to_datetime(s, errors="coerce")
                     return tt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(tt) else (s or "wrong")
                 df["交易时间"] = df["交易时间"].map(_fmt_any_time)
@@ -1239,14 +1269,15 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         except Exception as e:
             print("❌", p.name, e)
 
-    # 2) 老/新 农商行（跳过已处理 & 特殊抬头）
+    # 2) 老/新 农商行
     for p in old_rc + new_rc:
         if p in processed_files:
             continue
         print(f"正在处理 {p.name} ...")
         kw = should_skip_special(p)
         if kw:
-            print(f"⏩ 跳过【{p.name}】：表头含“{kw}”"); continue
+            print(f"⏩ 跳过【{p.name}】：表头含“{kw}”")
+            continue
         raw = _read_raw(p)
         holder = extract_holder_from_df(raw) or holder_from_folder(p.parent) or fallback_holder_from_path(p)
         is_old = p in old_rc
@@ -1255,28 +1286,32 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             df["来源文件"] = p.name
             _append_and_mark(df, p)
 
-    # 3) 泰隆（未处理过才处理）
+    # 3) 泰隆
     for p in tl_files:
         if p in processed_files:
             continue
         if "开户" in p.stem:
             continue
         print(f"正在处理 {p.name} ...")
-        try: xls = pd.ExcelFile(p)
+        try:
+            xls = pd.ExcelFile(p)
         except Exception as e:
-            print("❌", f"{p.name} 载入失败", e); continue
-        try: header_idx = _header_row(p)
-        except Exception: header_idx = 0
-        xls_dict={}
+            print("❌", f"{p.name} 载入失败", e)
+            continue
+        try:
+            header_idx = _header_row(p)
+        except Exception:
+            header_idx = 0
+        xls_dict = {}
         for sht in xls.sheet_names:
             try:
                 df_sheet = xls.parse(sheet_name=sht, header=header_idx)
-                xls_dict[sht]=df_sheet
+                xls_dict[sht] = df_sheet
             except Exception as e:
                 print("❌", f"{p.name}->{sht}", e)
         df = tl_to_template(xls_dict)
         if not df.empty:
-            df["来源文件"]=p.name
+            df["来源文件"] = p.name
             _append_and_mark(df, p)
 
     # 4) 民泰
@@ -1284,9 +1319,10 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         if p in processed_files:
             continue
         print(f"正在处理 {p.name} ...")
-        raw = _read_raw(p); df = mt_to_template(raw)
+        raw = _read_raw(p)
+        df = mt_to_template(raw)
         if not df.empty:
-            df["来源文件"]=p.name
+            df["来源文件"] = p.name
             _append_and_mark(df, p)
 
     # 5) 农行线下
@@ -1295,9 +1331,9 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             continue
         print(f"正在处理 {p.name} ...")
         try:
-            df=abc_offline_from_file(p)
+            df = abc_offline_from_file(p)
             if not df.empty:
-                df["来源文件"]=p.name
+                df["来源文件"] = p.name
                 _append_and_mark(df, p)
         except Exception as e:
             print("❌ 农行线下解析失败", p.name, e)
@@ -1308,9 +1344,9 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
             continue
         print(f"正在处理 {p.name} ...")
         try:
-            df=ccb_offline_from_file(p)
+            df = ccb_offline_from_file(p)
             if not df.empty:
-                df["来源文件"]=p.name
+                df["来源文件"] = p.name
                 _append_and_mark(df, p)
         except Exception as e:
             print("❌ 建行线下解析失败", p.name, e)
@@ -1323,54 +1359,105 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
         try:
             raw_csv = _read_csv_smart(p)
         except Exception as e:
-            print("❌ 无法读取CSV", p.name, e); continue
+            print("❌ 无法读取CSV", p.name, e)
+            continue
         holder = _person_from_people_csv(p.parent) or holder_from_folder(p.parent) or fallback_holder_from_path(p)
         feedback_unit = p.parent.name
         try:
             df = csv_to_template(raw_csv, holder, feedback_unit)
         except Exception as e:
-            print("❌ CSV转模板失败", p.name, e); continue
+            print("❌ CSV转模板失败", p.name, e)
+            continue
         if not df.empty:
-            df["来源文件"]=p.name
+            df["来源文件"] = p.name
             _append_and_mark(df, p)
 
     print("文件读取完成，正在整合……")
     if not dfs:
         return pd.DataFrame(columns=TEMPLATE_COLS)
 
-    all_txn = pd.concat(dfs, ignore_index=True)
+    # ========= 这里开始就是“导出重复记录 + 去重”的部分 =========
+    # 先拼成去重前全集
+    raw_txn = pd.concat(dfs, ignore_index=True)
 
-    all_txn["交易金额"] = pd.to_numeric(all_txn["交易金额"], errors="coerce").round(2)
-    before=len(all_txn)
-    all_txn = all_txn.drop_duplicates(subset=["交易流水号","交易时间","交易金额"], keep="first").reset_index(drop=True)
-    removed=before-len(all_txn)
-    if removed: print(f"🧹 去重 {removed} 条.")
+    raw_txn["交易金额"] = pd.to_numeric(raw_txn["交易金额"], errors="coerce").round(2)
 
+    # 导出被判定为重复的记录
+    dup_mask = raw_txn.duplicated(
+        subset=["交易流水号", "交易时间", "交易金额"],
+        keep="first"
+    )
+    dup_df = raw_txn[dup_mask].copy()
+    if not dup_df.empty:
+        save_df_auto_width(dup_df, "所有人-重复交易流水", index=False, engine="openpyxl")
+        print(f"✅ 已导出重复交易流水：{len(dup_df)} 条 -> 所有人-重复交易流水.xlsx")
+
+    # 在 raw_txn 上进行去重，得到最终 all_txn
+    before = len(raw_txn)
+    all_txn = raw_txn.drop_duplicates(
+        subset=["交易流水号", "交易时间", "交易金额"],
+        keep="first"
+    ).reset_index(drop=True)
+    removed = before - len(all_txn)
+    if removed:
+        print(f"🧹 去重 {removed} 条.")
+
+    # ========= 后面保持你原来的分析逻辑 =========
     ts = pd.to_datetime(all_txn["交易时间"], errors="coerce")
-    all_txn.insert(0,"__ts__",ts)
+    all_txn.insert(0, "__ts__", ts)
     all_txn.sort_values("__ts__", inplace=True, kind="mergesort")
-    all_txn["序号"] = range(1, len(all_txn)+1)
+    all_txn["序号"] = range(1, len(all_txn) + 1)
     all_txn.drop(columns="__ts__", inplace=True)
 
-    all_txn["借贷标志"]=all_txn["借贷标志"].apply(lambda x: "出" if safe_str(x).strip() in {"1","借","D"} else ("进" if safe_str(x).strip() in {"2","贷","C"} else safe_str(x)))
-    bins=[-np.inf,2000,5000,20000,50000,np.inf]; labels=["2000以下","2000-5000","5000-20000","20000-50000","50000以上"]
-    all_txn["金额区间"]=pd.cut(pd.to_numeric(all_txn["交易金额"], errors="coerce"), bins=bins, labels=labels, right=False, include_lowest=True)
-    weekday_map={0:"星期一",1:"星期二",2:"星期三",3:"星期四",4:"星期五",5:"星期六",6:"星期日"}
-    wk = pd.Series(index=all_txn.index, dtype=object); mask=ts.notna()
-    wk.loc[mask]=ts.dt.weekday.map(weekday_map); wk.loc[~mask]="wrong"; all_txn["星期"]=wk
-    dates=ts.dt.date; status=pd.Series(index=all_txn.index, dtype=object)
-    unique_dates=pd.unique(dates[mask])
-    @lru_cache(maxsize=None)
-    def _day_status(d)->str:
-        try: return "节假日" if is_holiday(d) else ("工作日" if is_workday(d) else "周末")
-        except Exception:
-            dd=datetime.datetime.combine(d, datetime.time())
-            return "周末" if dd.weekday()>=5 else "工作日"
-    if len(unique_dates):
-        mapd={d:_day_status(d) for d in unique_dates}; status.loc[mask]=dates.loc[mask].map(mapd)
-    status.loc[~mask]="wrong"; all_txn["节假日"]=status
+    all_txn["借贷标志"] = all_txn["借贷标志"].apply(
+        lambda x: "出" if safe_str(x).strip() in {"1", "借", "D"}
+        else ("进" if safe_str(x).strip() in {"2", "贷", "C"} else safe_str(x))
+    )
 
-    # —— 对方职务（通信映射优先）
+    bins = [-np.inf, 2000, 5000, 20000, 50000, np.inf]
+    labels = ["2000以下", "2000-5000", "5000-20000", "20000-50000", "50000以上"]
+    all_txn["金额区间"] = pd.cut(
+        pd.to_numeric(all_txn["交易金额"], errors="coerce"),
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    )
+
+    weekday_map = {
+        0: "星期一",
+        1: "星期二",
+        2: "星期三",
+        3: "星期四",
+        4: "星期五",
+        5: "星期六",
+        6: "星期日",
+    }
+    wk = pd.Series(index=all_txn.index, dtype=object)
+    mask = ts.notna()
+    wk.loc[mask] = ts.dt.weekday.map(weekday_map)
+    wk.loc[~mask] = "wrong"
+    all_txn["星期"] = wk
+
+    dates = ts.dt.date
+    status = pd.Series(index=all_txn.index, dtype=object)
+    unique_dates = pd.unique(dates[mask])
+
+    @lru_cache(maxsize=None)
+    def _day_status(d) -> str:
+        try:
+            return "节假日" if is_holiday(d) else ("工作日" if is_workday(d) else "周末")
+        except Exception:
+            dd = datetime.datetime.combine(d, datetime.time())
+            return "周末" if dd.weekday() >= 5 else "工作日"
+
+    if len(unique_dates):
+        mapd = {d: _day_status(d) for d in unique_dates}
+        status.loc[mask] = dates.loc[mask].map(mapd)
+    status.loc[~mask] = "wrong"
+    all_txn["节假日"] = status
+
+    # 对方职务（通信映射优先），如果没有通信映射就是空字符串
     final_title_by_name: Dict[str, str] = CALLLOG_NAME_TO_TITLE or {}
     all_txn["对方职务"] = all_txn["交易对方姓名"].map(final_title_by_name).fillna("")
 
@@ -1384,6 +1471,7 @@ def merge_all_txn(root_dir: str) -> pd.DataFrame:
     save_df_auto_width(all_txn, "所有人-合并交易流水", index=False, engine="openpyxl")
     print("✅ 已导出：所有人-合并交易流水.xlsx")
     return all_txn
+
 
 # ------------------------------------------------------------------
 # 分析
